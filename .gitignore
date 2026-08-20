@@ -1,0 +1,8 @@
+# Live/paper SQLite — never overwrite on git pull
+trade_history.db
+**/trade_history.db
+trade_history.db-wal
+trade_history.db-shm
+trade_history.db-journal
+*.db-wal
+*.db-shm
