@@ -1,5 +1,8 @@
 # config.py — live knobs. Keep PAPER_TRADING True until paper results are stable.
 
+# Scorecard / eval: ignore trades before this date (bugfix + volume strategy deploy)
+SCORECARD_SINCE = "2026-08-21"
+
 ACTIVE_INDICES = ["NIFTY", "SENSEX"]
 
 # Paper Trading Mode (Set to False for Live Broker Execution)

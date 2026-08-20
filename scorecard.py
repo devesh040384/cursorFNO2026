@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 from database import DatabaseManager
-from config import FALLBACK_LOT_SIZE
+from config import FALLBACK_LOT_SIZE, SCORECARD_SINCE
 
 
 def _qty(row):
@@ -113,32 +113,43 @@ def load_trades(db_manager):
     )
 
 
-def split_periods(all_rows, now=None):
+def split_periods(all_rows, now=None, since=None):
     now = now or datetime.now()
+    since = since or SCORECARD_SINCE
     today = now.strftime("%Y-%m-%d")
     week_start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-    closed = [r for r in all_rows if str(r["status"] or "").upper().startswith("CLOSED")]
-    open_rows = [r for r in all_rows if str(r["status"] or "").upper() == "OPEN"]
+    if week_start < since:
+        week_start = since
 
-    def in_range(row, start_prefix):
+    def on_or_after(row, start_prefix):
         dt = _entry_dt(row)
         if not dt:
             return False
         return dt.strftime("%Y-%m-%d") >= start_prefix
 
-    today_closed = [r for r in closed if in_range(r, today)]
-    week_closed = [r for r in closed if in_range(r, week_start)]
+    closed = [
+        r for r in all_rows
+        if str(r["status"] or "").upper().startswith("CLOSED") and on_or_after(r, since)
+    ]
+    open_rows = [
+        r for r in all_rows
+        if str(r["status"] or "").upper() == "OPEN" and on_or_after(r, since)
+    ]
+
+    today_closed = [r for r in closed if on_or_after(r, today)]
+    week_closed = [r for r in closed if on_or_after(r, week_start)]
     return {
         "today": today_closed,
         "week": week_closed,
         "all": closed,
         "open": open_rows,
+        "since": since,
     }
 
 
-def heartbeat_line(db_manager):
+def heartbeat_line(db_manager, since=None):
     rows = load_trades(db_manager)
-    parts = split_periods(rows)
+    parts = split_periods(rows, since=since)
     stats = summarize_closed(parts["today"])
     pf = stats["profit_factor"]
     pf_s = "n/a" if pf == float("inf") else f"{pf:.2f}"
@@ -154,13 +165,22 @@ def _fmt_pf(value):
     return f"{value:.2f}"
 
 
-def format_scorecard(db_manager, show_all=False):
+def format_scorecard(db_manager, show_all=False, since=None):
     rows = load_trades(db_manager)
-    parts = split_periods(rows)
-    lines = ["=" * 64, "  PAPER SESSION SCORECARD  (qty * price change)", "=" * 64]
-    periods = [("TODAY", parts["today"]), ("LAST 7 DAYS", parts["week"])]
+    parts = split_periods(rows, since=since)
+    since_label = parts.get("since") or SCORECARD_SINCE
+    lines = [
+        "=" * 64,
+        "  PAPER SESSION SCORECARD  (qty * price change)",
+        f"  Sample from {since_label} (bugfix + volume strategy deploy)",
+        "=" * 64,
+    ]
+    periods = [
+        ("TODAY", parts["today"]),
+        ("SINCE DEPLOY (7d window, not before deploy)", parts["week"]),
+    ]
     if show_all:
-        periods.append(("ALL CLOSED", parts["all"]))
+        periods.append((f"ALL CLOSED SINCE {since_label}", parts["all"]))
     for title, closed in periods:
         s = summarize_closed(closed)
         lines.append(f"\n{title}")
@@ -190,14 +210,15 @@ def format_scorecard(db_manager, show_all=False):
     return "\n".join(lines)
 
 
-def print_scorecard(db_path="trade_history.db", show_all=False):
+def print_scorecard(db_path="trade_history.db", show_all=False, since=None):
     db = DatabaseManager(db_path)
-    print(format_scorecard(db, show_all=show_all))
+    print(format_scorecard(db, show_all=show_all, since=since))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Paper session scorecard")
-    parser.add_argument("--all", action="store_true", help="Include all-time closed trades")
+    parser.add_argument("--all", action="store_true", help="Include all closed trades since deploy date")
+    parser.add_argument("--since", default=None, help="YYYY-MM-DD (default: 2026-08-21)")
     parser.add_argument("--db", default="trade_history.db")
     args = parser.parse_args()
-    print_scorecard(args.db, show_all=args.all)
+    print_scorecard(args.db, show_all=args.all, since=args.since)
