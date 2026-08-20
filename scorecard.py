@@ -71,6 +71,7 @@ def summarize_closed(rows):
 
     by_index = defaultdict(lambda: {"n": 0, "pnl": 0.0})
     by_reason = defaultdict(lambda: {"n": 0, "pnl": 0.0})
+    by_entry = defaultdict(lambda: {"n": 0, "pnl": 0.0})
     for row, pnl in zip(rows, pnls):
         keys = row.keys()
         idx = row["index_name"] if "index_name" in keys and row["index_name"] else "UNKNOWN"
@@ -79,6 +80,9 @@ def summarize_closed(rows):
         by_index[idx]["pnl"] += pnl
         by_reason[reason]["n"] += 1
         by_reason[reason]["pnl"] += pnl
+        if "entry_reason" in keys and row["entry_reason"]:
+            by_entry[row["entry_reason"]]["n"] += 1
+            by_entry[row["entry_reason"]]["pnl"] += pnl
 
     return {
         "trades": n,
@@ -94,6 +98,7 @@ def summarize_closed(rows):
         "max_drawdown": max_dd,
         "by_index": dict(by_index),
         "by_reason": dict(by_reason),
+        "by_entry": dict(by_entry),
     }
 
 
@@ -101,7 +106,7 @@ def load_trades(db_manager):
     return db_manager.fetch_all(
         """
         SELECT id, symbol, qty, index_name, entry_price, exit_price, status,
-               exit_reason, timestamp, entry_time, exit_time
+               exit_reason, entry_reason, timestamp, entry_time, exit_time
         FROM trades
         ORDER BY id ASC
         """
@@ -177,6 +182,9 @@ def format_scorecard(db_manager, show_all=False):
         if s["by_reason"]:
             rs = ", ".join(f"{k} n={v['n']} ₹{v['pnl']:.0f}" for k, v in sorted(s["by_reason"].items()))
             lines.append(f"  by exit: {rs}")
+        if s.get("by_entry"):
+            er = ", ".join(f"{k} n={v['n']} ₹{v['pnl']:.0f}" for k, v in sorted(s["by_entry"].items()))
+            lines.append(f"  by entry: {er}")
     lines.append(f"\nOPEN now: {len(parts['open'])} (unrealized skipped; no LTP fetch)")
     lines.append("=" * 64)
     return "\n".join(lines)

@@ -18,11 +18,13 @@ class VolumeExpansionGate:
         self.last_session_vol = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.subscribed = {symbol: False for symbol in INDICES_CONFIG.keys()}
         self.volume_ok = {symbol: False for symbol in INDICES_CONFIG.keys()}
+        self.breakout_event = {symbol: None for symbol in INDICES_CONFIG.keys()}
 
     def mark_subscribed(self, symbol, ok=True):
         self.subscribed[symbol] = bool(ok)
         if not ok:
             self.volume_ok[symbol] = False
+            self.breakout_event[symbol] = None
 
     def allows_entry(self, symbol):
         if not RISK.get("require_volume_expansion", True):
@@ -30,6 +32,14 @@ class VolumeExpansionGate:
         if not self.subscribed.get(symbol):
             return False
         return bool(self.volume_ok.get(symbol))
+
+    def consume_breakout(self, symbol, max_age_sec=90.0):
+        """Return True once for a fresh expansion; clears the event."""
+        ts = self.breakout_event.get(symbol)
+        self.breakout_event[symbol] = None
+        if ts is None:
+            return False
+        return (time.time() - float(ts)) <= max_age_sec
 
     def on_fut_tick(self, symbol, volume_traded_today=None, last_traded_qty=None):
         if symbol not in INDICES_CONFIG:
@@ -57,11 +67,14 @@ class VolumeExpansionGate:
             if len(hist) > 80:
                 hist.pop(0)
             self.closed_volumes[symbol] = hist
-            self.volume_ok[symbol] = volume_expanded(
+            expanded = volume_expanded(
                 hist,
                 mult=float(RISK.get("volume_mult", 1.5)),
                 sma_bars=int(RISK.get("volume_sma_bars", 20)),
             )
+            self.volume_ok[symbol] = expanded
+            if expanded:
+                self.breakout_event[symbol] = now
             self.forming_vol[symbol] = increment
             self.last_bar_time[symbol] = now
         else:
@@ -134,7 +147,7 @@ class StrategyBrain:
         except Exception as e:
             logging.error(f"❌ Error loading StrategyBrain state: {e}")
 
-    def _trigger_entry(self, symbol, spot_price, option_type, target_mult, sl_mult):
+    def _trigger_entry(self, symbol, spot_price, option_type, target_mult, sl_mult, entry_reason="RSI_HOOK"):
         try:
             if not self.order_manager:
                 return False
@@ -176,7 +189,7 @@ class StrategyBrain:
             target_price = round(opt_ltp * target_mult, 1)
             sl_price = round(opt_ltp * sl_mult, 1)
             logging.info(
-                f"[{symbol}] ENTRY {option_type} {opt_symbol} qty={qty} @ ₹{opt_ltp} "
+                f"[{symbol}] ENTRY {entry_reason} {option_type} {opt_symbol} qty={qty} @ ₹{opt_ltp} "
                 f"| T ₹{target_price} | SL ₹{sl_price}"
             )
             order_id = self.order_manager.execute_entry(
@@ -188,11 +201,39 @@ class StrategyBrain:
                 target_price=target_price,
                 stop_loss_price=sl_price,
                 index_name=symbol,
+                entry_reason=entry_reason,
             )
             return bool(order_id)
         except Exception as e:
             logging.error(f"❌ Entry failed for {symbol}: {e}")
             return False
+
+    def _try_volume_breakout(self, symbol, last_close, prev_close, macro_trend, config):
+        if not RISK.get("enable_volume_breakout", True):
+            return False
+        if not self.volume_gate.consume_breakout(symbol):
+            return False
+        if macro_trend == "CHOPPY":
+            logging.info(f"[{symbol}] VOLUME_BREAKOUT skipped: regime CHOPPY.")
+            return False
+        if macro_trend == "BULLISH" and last_close > prev_close:
+            logging.info(f"[{symbol}] VOLUME_BREAKOUT up-bar in bullish regime. Buying CE.")
+            return self._trigger_entry(
+                symbol, last_close, "CE",
+                config["trending_target_mult"], config["trending_sl_mult"],
+                entry_reason="VOLUME_BREAKOUT",
+            )
+        if macro_trend == "BEARISH" and last_close < prev_close:
+            logging.info(f"[{symbol}] VOLUME_BREAKOUT down-bar in bearish regime. Buying PE.")
+            return self._trigger_entry(
+                symbol, last_close, "PE",
+                config["trending_target_mult"], config["trending_sl_mult"],
+                entry_reason="VOLUME_BREAKOUT",
+            )
+        logging.info(
+            f"[{symbol}] VOLUME_BREAKOUT skipped: bar direction does not match {macro_trend}."
+        )
+        return False
 
     def evaluate_tick(self, symbol, spot_price, option_volume=None):
         if symbol not in INDICES_CONFIG:
@@ -239,6 +280,7 @@ class StrategyBrain:
         vwap_buffer = config.get("vwap_buffer", 10.0)
         ema_spread_min = config.get("ema_spread_min", 8.0)
         last_close = closed[-1]
+        prev_close = closed[-2] if len(closed) >= 2 else last_close
 
         if ema_9 > (ema_21 + ema_spread_min) and last_close > (session_mean + vwap_buffer):
             macro_trend = "BULLISH"
@@ -268,39 +310,48 @@ class StrategyBrain:
         if not closed_bar:
             return
 
+        fired = self._try_volume_breakout(symbol, last_close, prev_close, macro_trend, config)
+
         recent_rsis = self.closed_rsi.get(symbol, [])
         rsi_dipped_bullish = any(r < 45 for r in recent_rsis)
         rsi_spiked_bearish = any(r > 55 for r in recent_rsis)
 
-        fired = False
-        if macro_trend == "BULLISH":
+        if not fired and macro_trend == "BULLISH":
             if last_rsi < 50 and current_rsi >= 50 and rsi_dipped_bullish:
                 if not self.volume_gate.allows_entry(symbol):
                     logging.info(f"[{symbol}] CE hook skipped: futures volume not expanded.")
                 else:
                     logging.info(f"[{symbol}] Closed-bar CE: trend up, RSI hook through 50.")
                     fired = self._trigger_entry(
-                        symbol, last_close, "CE", config["trending_target_mult"], config["trending_sl_mult"]
+                        symbol, last_close, "CE",
+                        config["trending_target_mult"], config["trending_sl_mult"],
+                        entry_reason="RSI_HOOK",
                     )
-        elif macro_trend == "BEARISH":
+        elif not fired and macro_trend == "BEARISH":
             if last_rsi > 50 and current_rsi <= 50 and rsi_spiked_bearish:
                 if not self.volume_gate.allows_entry(symbol):
                     logging.info(f"[{symbol}] PE hook skipped: futures volume not expanded.")
                 else:
                     logging.info(f"[{symbol}] Closed-bar PE: trend down, RSI hook through 50.")
                     fired = self._trigger_entry(
-                        symbol, last_close, "PE", config["trending_target_mult"], config["trending_sl_mult"]
+                        symbol, last_close, "PE",
+                        config["trending_target_mult"], config["trending_sl_mult"],
+                        entry_reason="RSI_HOOK",
                     )
-        elif RISK.get("enable_choppy_entries") and macro_trend == "CHOPPY":
+        elif not fired and RISK.get("enable_choppy_entries") and macro_trend == "CHOPPY":
             if not self.volume_gate.allows_entry(symbol):
                 pass
             elif last_rsi < 80 and current_rsi >= 80:
                 fired = self._trigger_entry(
-                    symbol, last_close, "PE", config["choppy_target_mult"], config["choppy_sl_mult"]
+                    symbol, last_close, "PE",
+                    config["choppy_target_mult"], config["choppy_sl_mult"],
+                    entry_reason="RSI_HOOK",
                 )
             elif last_rsi > 20 and current_rsi <= 20:
                 fired = self._trigger_entry(
-                    symbol, last_close, "CE", config["choppy_target_mult"], config["choppy_sl_mult"]
+                    symbol, last_close, "CE",
+                    config["choppy_target_mult"], config["choppy_sl_mult"],
+                    entry_reason="RSI_HOOK",
                 )
 
         if fired:

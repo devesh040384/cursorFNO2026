@@ -62,6 +62,7 @@ class OrderExecutionEngine:
         stop_loss_price=0.0,
         index_name=None,
         order_type="MARKET",
+        entry_reason=None,
     ):
         qty = int(qty)
         if qty <= 0:
@@ -70,6 +71,7 @@ class OrderExecutionEngine:
 
         logging.info(
             f"⚙️ ENTRY BUY {qty}x {symbol} ({exchange}) | Paper={self.paper_trading}"
+            f"{' | ' + entry_reason if entry_reason else ''}"
         )
         fill_price = price if price > 0 else self._fetch_ltp(exchange, symbol, token, price)
 
@@ -79,6 +81,7 @@ class OrderExecutionEngine:
             trade_id = self.db_manager.log_trade(
                 symbol, token, fill_price, target_price, stop_loss_price,
                 qty=qty, exchange=exchange, index_name=index_name,
+                entry_reason=entry_reason,
             )
             logging.info(f"✅ [PAPER] BUY {symbol} @ ₹{fill_price} | db#{trade_id} | {order_id}")
             return order_id
@@ -90,6 +93,7 @@ class OrderExecutionEngine:
         trade_id = self.db_manager.log_trade(
             symbol, token, fill_price, target_price, stop_loss_price,
             qty=qty, exchange=exchange, index_name=index_name,
+            entry_reason=entry_reason,
         )
         logging.info(f"✅ [LIVE] BUY {symbol} @ ₹{fill_price} | db#{trade_id} | {order_id}")
         return order_id
@@ -138,7 +142,7 @@ class OrderExecutionEngine:
         if str(trans_type).upper() == "BUY":
             return self.execute_entry(
                 symbol, token, qty, exchange, price, target_price, stop_loss_price,
-                index_name=index_name, order_type=order_type,
+                index_name=index_name, order_type=order_type, entry_reason=reason,
             )
         if trade_id is None:
             logging.error("❌ SELL refused: pass trade_id so the OPEN row is updated, not duplicated.")

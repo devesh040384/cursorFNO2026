@@ -15,6 +15,7 @@ SCHEMA_COLUMNS = {
     "exit_price": "REAL",
     "exit_time": "TEXT",
     "exit_reason": "TEXT",
+    "entry_reason": "TEXT",
     "timestamp": "TEXT",
 }
 
@@ -63,6 +64,7 @@ class DatabaseManager:
                         exit_price REAL,
                         exit_time TEXT,
                         exit_reason TEXT,
+                        entry_reason TEXT,
                         timestamp TEXT,
                         entry_time TEXT
                     )
@@ -88,6 +90,7 @@ class DatabaseManager:
         qty=None,
         exchange=None,
         index_name=None,
+        entry_reason=None,
     ):
         """Logs a new entry. Returns trade id or None."""
         try:
@@ -98,13 +101,13 @@ class DatabaseManager:
                     INSERT INTO trades (
                         symbol, token, qty, exchange, index_name,
                         entry_price, target_price, stop_loss_price, peak_price,
-                        status, timestamp, entry_time
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        status, timestamp, entry_time, entry_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         symbol, token, qty, exchange, index_name,
                         entry_price, target_price, stop_loss_price, entry_price,
-                        status, now_ist, now_ist,
+                        status, now_ist, now_ist, entry_reason,
                     ),
                 )
                 trade_id = cursor.lastrowid

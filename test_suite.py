@@ -3,13 +3,13 @@ import tempfile
 import unittest
 from datetime import datetime
 from risk_manager import RiskManager
-from config import RISK
+from config import RISK, INDICES_CONFIG
 from database import DatabaseManager
 from order_execution import OrderExecutionEngine
 from indicators import wilder_rsi, sma_rsi, volume_expanded, TechnicalIndicators
 from scorecard import summarize_closed, trade_pnl, heartbeat_line
 from options_chain_builder import DynamicOptionsChainBuilder
-from strategy_brain import VolumeExpansionGate
+from strategy_brain import VolumeExpansionGate, StrategyBrain
 
 
 class TestAlgoEngineCore(unittest.TestCase):
@@ -153,8 +153,78 @@ class TestAlgoEngineCore(unittest.TestCase):
 
     def test_volume_config_flags_present(self):
         self.assertTrue(RISK["require_volume_expansion"])
+        self.assertTrue(RISK["enable_volume_breakout"])
         self.assertEqual(RISK["volume_sma_bars"], 20)
         self.assertEqual(RISK["volume_mult"], 1.5)
+
+    def test_volume_breakout_consume_once_and_skip_choppy(self):
+        import time as time_mod
+
+        class FakeAPI:
+            def ltpData(self, *a, **k):
+                return {"status": True, "data": {"ltp": 100.0}}
+
+        class FakeOM:
+            def __init__(self):
+                self.calls = []
+                self.smart_api = FakeAPI()
+
+            def execute_entry(self, **kwargs):
+                self.calls.append(kwargs)
+                return "oid"
+
+        class FakeBuilder:
+            def get_nearest_expiry_contract(self, spot, instrument_type="CE"):
+                return {
+                    "symbol": "NIFTYCE",
+                    "token": "1",
+                    "lotsize": 65,
+                    "exchange": "NFO",
+                }
+
+        om = FakeOM()
+        brain = StrategyBrain(
+            order_engine=om,
+            options_builders={"26000": FakeBuilder()},
+            db_manager=None,
+        )
+        brain.volume_gate.mark_subscribed("NIFTY", True)
+        cfg = INDICES_CONFIG["NIFTY"]
+
+        gate = brain.volume_gate
+        gate.breakout_event["NIFTY"] = time_mod.time()
+        self.assertTrue(gate.consume_breakout("NIFTY"))
+        self.assertFalse(gate.consume_breakout("NIFTY"))
+
+        gate.breakout_event["NIFTY"] = time_mod.time()
+        fired = brain._try_volume_breakout("NIFTY", 101.0, 100.0, "BULLISH", cfg)
+        self.assertTrue(fired)
+        self.assertEqual(om.calls[0]["entry_reason"], "VOLUME_BREAKOUT")
+        self.assertFalse(brain._try_volume_breakout("NIFTY", 101.0, 100.0, "BULLISH", cfg))
+        self.assertEqual(len(om.calls), 1)
+
+        gate.breakout_event["NIFTY"] = time_mod.time()
+        skipped = brain._try_volume_breakout("NIFTY", 101.0, 100.0, "CHOPPY", cfg)
+        self.assertFalse(skipped)
+        self.assertEqual(len(om.calls), 1)
+        self.assertIsNone(gate.breakout_event["NIFTY"])
+
+    def test_scorecard_by_entry_reason(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            db = DatabaseManager(path)
+            tid = db.log_trade(
+                "NIFTY24CE", "1", 100.0, 122.0, 90.0,
+                qty=65, exchange="NFO", index_name="NIFTY", entry_reason="VOLUME_BREAKOUT",
+            )
+            db.close_trade(tid, 110.0, "TARGET_HIT")
+            rows = db.fetch_all("SELECT * FROM trades")
+            stats = summarize_closed(rows)
+            self.assertIn("VOLUME_BREAKOUT", stats["by_entry"])
+            self.assertEqual(stats["by_entry"]["VOLUME_BREAKOUT"]["n"], 1)
+        finally:
+            os.remove(path)
 
 
 if __name__ == "__main__":

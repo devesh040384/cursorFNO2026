@@ -21,6 +21,7 @@ RISK = {
     "time_stop_minutes": 25,
     "time_stop_min_gain_mult": 1.02,
     "require_volume_expansion": True,
+    "enable_volume_breakout": True,
     "volume_sma_bars": 20,
     "volume_mult": 1.5,
 }
