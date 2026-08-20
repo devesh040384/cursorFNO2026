@@ -143,7 +143,7 @@ def heartbeat_line(db_manager):
     pf = stats["profit_factor"]
     pf_s = "n/a" if pf == float("inf") else f"{pf:.2f}"
     return (
-        f"PnL ₹{stats['total_pnl']:.0f} | WR {stats['win_rate']:.0f}% "
+        f"PnL INR {stats['total_pnl']:.0f} | WR {stats['win_rate']:.0f}% "
         f"({stats['wins']}/{stats['trades']}) | PF {pf_s} | open {len(parts['open'])}"
     )
 
@@ -169,21 +169,21 @@ def format_scorecard(db_manager, show_all=False):
             f"win rate {s['win_rate']:.1f}%"
         )
         lines.append(
-            f"  PnL ₹{s['total_pnl']:.2f}  avg win ₹{s['avg_win']:.2f}  "
-            f"avg loss ₹{s['avg_loss']:.2f}"
+            f"  PnL INR {s['total_pnl']:.2f}  avg win INR {s['avg_win']:.2f}  "
+            f"avg loss INR {s['avg_loss']:.2f}"
         )
         lines.append(
             f"  profit factor {_fmt_pf(s['profit_factor'])}  "
-            f"expectancy ₹{s['expectancy']:.2f}  max DD ₹{s['max_drawdown']:.2f}"
+            f"expectancy INR {s['expectancy']:.2f}  max DD INR {s['max_drawdown']:.2f}"
         )
         if s["by_index"]:
-            idx = ", ".join(f"{k} n={v['n']} ₹{v['pnl']:.0f}" for k, v in sorted(s["by_index"].items()))
+            idx = ", ".join(f"{k} n={v['n']} INR {v['pnl']:.0f}" for k, v in sorted(s["by_index"].items()))
             lines.append(f"  by index: {idx}")
         if s["by_reason"]:
-            rs = ", ".join(f"{k} n={v['n']} ₹{v['pnl']:.0f}" for k, v in sorted(s["by_reason"].items()))
+            rs = ", ".join(f"{k} n={v['n']} INR {v['pnl']:.0f}" for k, v in sorted(s["by_reason"].items()))
             lines.append(f"  by exit: {rs}")
         if s.get("by_entry"):
-            er = ", ".join(f"{k} n={v['n']} ₹{v['pnl']:.0f}" for k, v in sorted(s["by_entry"].items()))
+            er = ", ".join(f"{k} n={v['n']} INR {v['pnl']:.0f}" for k, v in sorted(s["by_entry"].items()))
             lines.append(f"  by entry: {er}")
     lines.append(f"\nOPEN now: {len(parts['open'])} (unrealized skipped; no LTP fetch)")
     lines.append("=" * 64)
