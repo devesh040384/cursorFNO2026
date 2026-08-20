@@ -1,0 +1,311 @@
+import time
+import json
+import os
+import logging
+from datetime import datetime, timedelta
+from config import FALLBACK_LOT_SIZE, INDICES_CONFIG, RISK
+from risk_manager import RiskManager
+from indicators import wilder_rsi, volume_expanded
+
+
+class VolumeExpansionGate:
+    """1-minute futures volume vs SMA. Fail closed until 20 bars and a live subscribe."""
+
+    def __init__(self):
+        self.closed_volumes = {symbol: [] for symbol in INDICES_CONFIG.keys()}
+        self.forming_vol = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
+        self.last_bar_time = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
+        self.last_session_vol = {symbol: None for symbol in INDICES_CONFIG.keys()}
+        self.subscribed = {symbol: False for symbol in INDICES_CONFIG.keys()}
+        self.volume_ok = {symbol: False for symbol in INDICES_CONFIG.keys()}
+
+    def mark_subscribed(self, symbol, ok=True):
+        self.subscribed[symbol] = bool(ok)
+        if not ok:
+            self.volume_ok[symbol] = False
+
+    def allows_entry(self, symbol):
+        if not RISK.get("require_volume_expansion", True):
+            return True
+        if not self.subscribed.get(symbol):
+            return False
+        return bool(self.volume_ok.get(symbol))
+
+    def on_fut_tick(self, symbol, volume_traded_today=None, last_traded_qty=None):
+        if symbol not in INDICES_CONFIG:
+            return
+        now = time.time()
+        if self.last_bar_time[symbol] == 0.0:
+            self.last_bar_time[symbol] = now
+
+        increment = 0.0
+        if volume_traded_today is not None:
+            prev = self.last_session_vol[symbol]
+            current = float(volume_traded_today)
+            if prev is None:
+                increment = 0.0
+            else:
+                increment = max(0.0, current - prev)
+            self.last_session_vol[symbol] = current
+        elif last_traded_qty is not None:
+            increment = max(0.0, float(last_traded_qty))
+
+        if now - self.last_bar_time[symbol] >= 60:
+            closed = self.forming_vol[symbol]
+            hist = self.closed_volumes[symbol]
+            hist.append(closed)
+            if len(hist) > 80:
+                hist.pop(0)
+            self.closed_volumes[symbol] = hist
+            self.volume_ok[symbol] = volume_expanded(
+                hist,
+                mult=float(RISK.get("volume_mult", 1.5)),
+                sma_bars=int(RISK.get("volume_sma_bars", 20)),
+            )
+            self.forming_vol[symbol] = increment
+            self.last_bar_time[symbol] = now
+        else:
+            self.forming_vol[symbol] += increment
+
+
+class StrategyBrain:
+    def __init__(self, order_manager=None, order_engine=None, **kwargs):
+        self.order_manager = order_manager or order_engine
+        self.options_builders = kwargs.get("options_builders", {})
+        self.db = kwargs.get("db_manager")
+        if self.db is None and self.order_manager is not None:
+            self.db = getattr(self.order_manager, "db_manager", None)
+        self.risk = kwargs.get("risk_manager") or RiskManager(db_manager=self.db)
+
+        self.price_histories = {symbol: [] for symbol in INDICES_CONFIG.keys()}
+        self.closed_rsi = {symbol: [] for symbol in INDICES_CONFIG.keys()}
+        self.last_candle_times = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
+        self.cooldown_until = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
+        self.last_closed_rsi = {symbol: 50.0 for symbol in INDICES_CONFIG.keys()}
+        self.current_regimes = {symbol: "INITIALIZING" for symbol in INDICES_CONFIG.keys()}
+        self.volume_gate = kwargs.get("volume_gate") or VolumeExpansionGate()
+
+        self.state_file = "rsi_state.json"
+        self._load_state()
+
+    def _calculate_rsi(self, prices, period=14):
+        return wilder_rsi(prices, period=period)
+
+    def _calculate_ema(self, history, period):
+        if len(history) < period:
+            return sum(history) / len(history) if history else 0.0
+        multiplier = 2 / (period + 1)
+        ema = sum(history[:period]) / period
+        for price in history[period:]:
+            ema = (price - ema) * multiplier + ema
+        return ema
+
+    def _save_state(self):
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            with open(self.state_file, "w") as f:
+                json.dump({
+                    "date": today_str,
+                    "price_histories": self.price_histories,
+                    "last_closed_rsi": self.last_closed_rsi,
+                    "last_candle_times": self.last_candle_times,
+                }, f)
+        except Exception as e:
+            logging.error(f"❌ Error saving StrategyBrain state: {e}")
+
+    def _load_state(self):
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            with open(self.state_file, "r") as f:
+                state = json.load(f)
+            if state.get("date", "") != today_str:
+                return
+            loaded = state.get("price_histories", {})
+            for symbol in INDICES_CONFIG.keys():
+                if symbol in loaded:
+                    self.price_histories[symbol] = loaded[symbol]
+            self.last_closed_rsi = state.get("last_closed_rsi", self.last_closed_rsi)
+            # backward compat with older state key
+            if "last_arsis" in state and "last_closed_rsi" not in state:
+                self.last_closed_rsi = state.get("last_arsis", self.last_closed_rsi)
+            self.last_candle_times = state.get("last_candle_times", self.last_candle_times)
+        except Exception as e:
+            logging.error(f"❌ Error loading StrategyBrain state: {e}")
+
+    def _trigger_entry(self, symbol, spot_price, option_type, target_mult, sl_mult):
+        try:
+            if not self.order_manager:
+                return False
+            self.risk.refresh_from_db()
+            if self.risk.trading_halted:
+                return False
+
+            config = INDICES_CONFIG.get(symbol, {})
+            index_token = str(config.get("index_token"))
+            builder = self.options_builders.get(index_token)
+            if not builder:
+                return False
+
+            contract = builder.get_nearest_expiry_contract(spot_price, instrument_type=option_type)
+            if not contract:
+                return False
+
+            opt_symbol = contract.get("symbol")
+            opt_token = str(contract.get("token"))
+            exchange = contract.get("exchange") or config.get("option_exchange") or (
+                "BFO" if symbol == "SENSEX" else "NFO"
+            )
+            qty = int(contract.get("lotsize") or FALLBACK_LOT_SIZE.get(symbol, 0))
+            if qty <= 0 or not opt_symbol or not opt_token:
+                logging.error(f"[{symbol}] Missing lot/token for {opt_symbol}")
+                return False
+
+            ltp_resp = self.order_manager.smart_api.ltpData(exchange, opt_symbol, opt_token)
+            if not (ltp_resp and ltp_resp.get("status") and ltp_resp.get("data")):
+                return False
+            opt_ltp = float(ltp_resp["data"]["ltp"])
+
+            if not self.risk.assess_order_safety(
+                {"qty": qty, "index_name": symbol, "symbol": opt_symbol},
+                estimated_premium=opt_ltp,
+            ):
+                return False
+
+            target_price = round(opt_ltp * target_mult, 1)
+            sl_price = round(opt_ltp * sl_mult, 1)
+            logging.info(
+                f"[{symbol}] ENTRY {option_type} {opt_symbol} qty={qty} @ ₹{opt_ltp} "
+                f"| T ₹{target_price} | SL ₹{sl_price}"
+            )
+            order_id = self.order_manager.execute_entry(
+                symbol=opt_symbol,
+                token=opt_token,
+                qty=qty,
+                exchange=exchange,
+                price=opt_ltp,
+                target_price=target_price,
+                stop_loss_price=sl_price,
+                index_name=symbol,
+            )
+            return bool(order_id)
+        except Exception as e:
+            logging.error(f"❌ Entry failed for {symbol}: {e}")
+            return False
+
+    def evaluate_tick(self, symbol, spot_price, option_volume=None):
+        if symbol not in INDICES_CONFIG:
+            return
+        current_time = time.time()
+        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        current_hour_min = now_ist.hour * 100 + now_ist.minute
+
+        history = self.price_histories.get(symbol, [])
+        state_changed = False
+        closed_bar = False
+
+        last_candle_time = self.last_candle_times.get(symbol, 0.0)
+        if current_time - last_candle_time >= 60:
+            if history:
+                closed_bar = True
+            history.append(spot_price)
+            if len(history) > 375:
+                history.pop(0)
+            self.last_candle_times[symbol] = current_time
+            state_changed = True
+        elif len(history) == 0:
+            history.append(spot_price)
+            self.last_candle_times[symbol] = current_time
+            state_changed = True
+        else:
+            history[-1] = spot_price
+
+        self.price_histories[symbol] = history
+        if len(history) < 22:
+            if state_changed:
+                self._save_state()
+            return
+
+        # Regime uses closed bars only so the forming candle cannot flicker entries
+        closed = history[:-1]
+        ema_9 = self._calculate_ema(closed, 9)
+        ema_21 = self._calculate_ema(closed, 21)
+        session_mean = sum(closed) / len(closed)
+        current_rsi = self._calculate_rsi(closed)
+        last_rsi = self.last_closed_rsi.get(symbol, 50.0)
+
+        config = INDICES_CONFIG[symbol]
+        vwap_buffer = config.get("vwap_buffer", 10.0)
+        ema_spread_min = config.get("ema_spread_min", 8.0)
+        last_close = closed[-1]
+
+        if ema_9 > (ema_21 + ema_spread_min) and last_close > (session_mean + vwap_buffer):
+            macro_trend = "BULLISH"
+        elif ema_9 < (ema_21 - ema_spread_min) and last_close < (session_mean - vwap_buffer):
+            macro_trend = "BEARISH"
+        else:
+            macro_trend = "CHOPPY"
+        self.current_regimes[symbol] = macro_trend
+
+        if closed_bar:
+            bucket = self.closed_rsi.setdefault(symbol, [])
+            bucket.append(current_rsi)
+            if len(bucket) > 5:
+                bucket.pop(0)
+
+        if current_hour_min < RISK["session_start_hhmm"] or current_hour_min >= RISK["entry_cutoff_hhmm"]:
+            if closed_bar:
+                self.last_closed_rsi[symbol] = current_rsi
+                self._save_state()
+            return
+
+        if current_time < self.cooldown_until.get(symbol, 0.0):
+            if closed_bar:
+                self.last_closed_rsi[symbol] = current_rsi
+            return
+
+        if not closed_bar:
+            return
+
+        recent_rsis = self.closed_rsi.get(symbol, [])
+        rsi_dipped_bullish = any(r < 45 for r in recent_rsis)
+        rsi_spiked_bearish = any(r > 55 for r in recent_rsis)
+
+        fired = False
+        if macro_trend == "BULLISH":
+            if last_rsi < 50 and current_rsi >= 50 and rsi_dipped_bullish:
+                if not self.volume_gate.allows_entry(symbol):
+                    logging.info(f"[{symbol}] CE hook skipped: futures volume not expanded.")
+                else:
+                    logging.info(f"[{symbol}] Closed-bar CE: trend up, RSI hook through 50.")
+                    fired = self._trigger_entry(
+                        symbol, last_close, "CE", config["trending_target_mult"], config["trending_sl_mult"]
+                    )
+        elif macro_trend == "BEARISH":
+            if last_rsi > 50 and current_rsi <= 50 and rsi_spiked_bearish:
+                if not self.volume_gate.allows_entry(symbol):
+                    logging.info(f"[{symbol}] PE hook skipped: futures volume not expanded.")
+                else:
+                    logging.info(f"[{symbol}] Closed-bar PE: trend down, RSI hook through 50.")
+                    fired = self._trigger_entry(
+                        symbol, last_close, "PE", config["trending_target_mult"], config["trending_sl_mult"]
+                    )
+        elif RISK.get("enable_choppy_entries") and macro_trend == "CHOPPY":
+            if not self.volume_gate.allows_entry(symbol):
+                pass
+            elif last_rsi < 80 and current_rsi >= 80:
+                fired = self._trigger_entry(
+                    symbol, last_close, "PE", config["choppy_target_mult"], config["choppy_sl_mult"]
+                )
+            elif last_rsi > 20 and current_rsi <= 20:
+                fired = self._trigger_entry(
+                    symbol, last_close, "CE", config["choppy_target_mult"], config["choppy_sl_mult"]
+                )
+
+        if fired:
+            self.cooldown_until[symbol] = time.time() + 900
+
+        self.last_closed_rsi[symbol] = current_rsi
+        if state_changed:
+            self._save_state()

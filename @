@@ -1,0 +1,56 @@
+import logging
+import time
+
+class StrategyBrain:
+    def __init__(self, order_engine=None):
+        self.order_engine = order_engine
+        # Throttle dictionary to prevent log spamming per symbol
+        self._last_log_time = {}
+        self.log_interval = 5.0  # Print status watch log at most once every 5 seconds per symbol
+
+    def evaluate_tick(self, symbol, spot_price, ema20, ema50):
+        """
+        Evaluates incoming tick data against EMA convergence rules and triggers signals.
+        """
+        try:
+            diff = abs(ema20 - ema50)
+            current_time = time.time()
+            last_logged = self._last_log_time.get(symbol, 0)
+
+            # Throttled watch log so the screen doesn't get flooded
+            if current_time - last_logged >= self.log_interval:
+                logging.info(f"👀 [WATCH] EMAs converging on {symbol} spot {spot_price:.2f} | Diff: {diff:.2f} | EMA20: {ema20:.2f}, EMA50: {ema50:.2f}")
+                self._last_log_time[symbol] = current_time
+
+            # Define convergence threshold (adjust as needed based on your strategy parameters)
+            convergence_threshold = 0.5
+
+            if diff <= convergence_threshold:
+                # Determine signal direction based on EMA crossover/trend alignment
+                if ema20 < ema50:
+                    signal_type = "BUY_PUT"
+                    logging.info(f"🚀 Signal Generated for {symbol}: {signal_type}")
+                    
+                    if self.order_engine:
+                        self.order_engine.execute_options_order(
+                            symbol=symbol,
+                            signal_type=signal_type,
+                            spot_price=spot_price,
+                            target_spot=spot_price * 1.01,  # Example target calculation
+                            stop_spot=spot_price * 0.99     # Example stop loss calculation
+                        )
+                elif ema20 > ema50:
+                    signal_type = "BUY_CALL"
+                    logging.info(f"🚀 Signal Generated for {symbol}: {signal_type}")
+                    
+                    if self.order_engine:
+                        self.order_engine.execute_options_order(
+                            symbol=symbol,
+                            signal_type=signal_type,
+                            spot_price=spot_price,
+                            target_spot=spot_price * 1.01,
+                            stop_spot=spot_price * 0.99
+                        )
+
+        except Exception as e:
+            logging.error(f"❌ Error in strategy evaluation for {symbol}: {e}")

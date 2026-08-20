@@ -1,0 +1,161 @@
+import os
+import tempfile
+import unittest
+from datetime import datetime
+from risk_manager import RiskManager
+from config import RISK
+from database import DatabaseManager
+from order_execution import OrderExecutionEngine
+from indicators import wilder_rsi, sma_rsi, volume_expanded, TechnicalIndicators
+from scorecard import summarize_closed, trade_pnl, heartbeat_line
+from options_chain_builder import DynamicOptionsChainBuilder
+from strategy_brain import VolumeExpansionGate
+
+
+class TestAlgoEngineCore(unittest.TestCase):
+    def test_paise_conversion(self):
+        raw_paise_tick = 9965.0
+        parsed_price = raw_paise_tick / 100.0 if raw_paise_tick > 500 else float(raw_paise_tick)
+        self.assertEqual(parsed_price, 99.65)
+
+    def test_risk_manager_limit(self):
+        risk = RiskManager(max_daily_loss_inr=5000.0, max_consecutive_losses=3)
+        risk.register_trade_result(-2000.0)
+        self.assertEqual(risk.trading_halted, False)
+        risk.register_trade_result(-3500.0)
+        self.assertEqual(risk.trading_halted, True)
+
+    def test_min_loss_caps_are_tighter_than_old_defaults(self):
+        self.assertLessEqual(RISK["max_daily_loss_inr"], 2000.0)
+        self.assertLessEqual(RISK["max_consecutive_losses"], 3)
+        self.assertFalse(RISK["enable_choppy_entries"])
+        self.assertLessEqual(RISK["entry_cutoff_hhmm"], 1430)
+
+    def test_paper_exit_updates_open_row_and_does_not_insert(self):
+        class DummyAPI:
+            def ltpData(self, *a, **k):
+                return {"status": True, "data": {"ltp": 120.0}}
+
+            def placeOrder(self, *a, **k):
+                raise AssertionError("live order should not run in paper")
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            db = DatabaseManager(path)
+            eng = OrderExecutionEngine(DummyAPI(), db, paper_trading=True)
+            oid = eng.execute_entry(
+                "NIFTY26AUG24500CE", "123", 65, "NFO", 120.0, 146.4, 108.0, index_name="NIFTY"
+            )
+            self.assertTrue(oid)
+            self.assertEqual(db.count_open_trades(), 1)
+            row = db.fetch_one("SELECT id, qty, status FROM trades WHERE status = 'OPEN'")
+            self.assertEqual(int(row["qty"]), 65)
+            ok = eng.execute_exit(row["id"], "NIFTY26AUG24500CE", "123", 65, "NFO", 125.0, reason="TARGET_HIT")
+            self.assertTrue(ok)
+            self.assertEqual(db.count_open_trades(), 0)
+            eng.execute_order("X", "1", 65, trans_type="SELL", exchange="NFO", price=1)
+            self.assertEqual(db.fetch_one("SELECT COUNT(*) FROM trades")[0], 1)
+        finally:
+            os.remove(path)
+
+    def test_wilder_rsi_differs_from_sma_and_matches_recursive_seed(self):
+        closes = [
+            44.34, 44.09, 44.15, 43.61, 44.33, 44.83, 45.10, 45.42,
+            45.84, 46.08, 45.89, 46.03, 45.61, 46.28, 46.28, 46.00,
+            46.03, 46.41, 46.22, 45.64,
+        ]
+        self.assertEqual(wilder_rsi(closes[:14]), 50.0)
+        w = wilder_rsi(closes)
+        s = sma_rsi(closes)
+        self.assertNotAlmostEqual(w, s, places=4)
+        self.assertEqual(wilder_rsi(list(range(1, 30))), 100.0)
+        self.assertEqual(wilder_rsi([10.0] * 20), 50.0)
+        self.assertEqual(TechnicalIndicators.calculate_rsi(closes), w)
+
+        period = 14
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            ch = closes[i] - closes[i - 1]
+            gains.append(max(ch, 0.0))
+            losses.append(max(-ch, 0.0))
+        avg_g = sum(gains[:period]) / period
+        avg_l = sum(losses[:period]) / period
+        for i in range(period, len(gains)):
+            avg_g = (avg_g * (period - 1) + gains[i]) / period
+            avg_l = (avg_l * (period - 1) + losses[i]) / period
+        expected = 100.0 - (100.0 / (1.0 + avg_g / avg_l))
+        self.assertAlmostEqual(w, expected, places=8)
+
+    def test_volume_expansion_needs_20_bars_and_mult(self):
+        self.assertFalse(volume_expanded([100] * 19, 1.5, 20))
+        self.assertFalse(volume_expanded([100] * 20, 1.5, 20))
+        self.assertTrue(volume_expanded([100] * 19 + [151], 1.5, 20))
+        self.assertFalse(volume_expanded([100] * 19 + [149], 1.5, 20))
+
+    def test_volume_gate_fail_closed_until_subscribe_and_bars(self):
+        gate = VolumeExpansionGate()
+        self.assertFalse(gate.allows_entry("NIFTY"))
+        gate.mark_subscribed("NIFTY", True)
+        self.assertFalse(gate.allows_entry("NIFTY"))
+        gate.closed_volumes["NIFTY"] = [100] * 19 + [200]
+        gate.volume_ok["NIFTY"] = volume_expanded(gate.closed_volumes["NIFTY"], 1.5, 20)
+        self.assertTrue(gate.allows_entry("NIFTY"))
+
+    def test_scorecard_pnl_uses_stored_qty(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            db = DatabaseManager(path)
+            tid = db.log_trade("NIFTY24CE", "1", 100.0, 122.0, 90.0, qty=65, exchange="NFO", index_name="NIFTY")
+            db.close_trade(tid, 110.0, "TARGET_HIT")
+            tid2 = db.log_trade("SENSEX24PE", "2", 200.0, 244.0, 180.0, qty=20, exchange="BFO", index_name="SENSEX")
+            db.close_trade(tid2, 180.0, "STOP_LOSS_HIT")
+            rows = db.fetch_all("SELECT * FROM trades ORDER BY id")
+            self.assertEqual(trade_pnl(rows[0]), 10.0 * 65)
+            self.assertEqual(trade_pnl(rows[1]), -20.0 * 20)
+            stats = summarize_closed(rows)
+            self.assertEqual(stats["trades"], 2)
+            self.assertEqual(stats["wins"], 1)
+            self.assertEqual(stats["losses"], 1)
+            self.assertAlmostEqual(stats["total_pnl"], 650 - 400)
+            line = heartbeat_line(db)
+            self.assertIn("PnL", line)
+            self.assertIn("open 0", line)
+        finally:
+            os.remove(path)
+
+    def test_nearest_future_resolution(self):
+        builder = DynamicOptionsChainBuilder(index_name="NIFTY", smart_api=None)
+        today = datetime.now().strftime("%d%b%Y").upper()
+        builder.scrip_master_data = [
+            {
+                "name": "NIFTY",
+                "instrumenttype": "FUTIDX",
+                "exch_seg": "NFO",
+                "symbol": "NIFTYFUT",
+                "token": "99999",
+                "expiry": today,
+            },
+            {
+                "name": "BANKNIFTY",
+                "instrumenttype": "FUTIDX",
+                "exch_seg": "NFO",
+                "symbol": "BANKNIFTYFUT",
+                "token": "111",
+                "expiry": today,
+            },
+        ]
+        fut = builder.get_nearest_expiry_future()
+        self.assertIsNotNone(fut)
+        self.assertEqual(fut["token"], "99999")
+        self.assertEqual(fut["exchange_type"], 2)
+
+    def test_volume_config_flags_present(self):
+        self.assertTrue(RISK["require_volume_expansion"])
+        self.assertEqual(RISK["volume_sma_bars"], 20)
+        self.assertEqual(RISK["volume_mult"], 1.5)
+
+
+if __name__ == "__main__":
+    unittest.main()

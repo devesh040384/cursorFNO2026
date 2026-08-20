@@ -1,0 +1,202 @@
+import os
+import sys
+import time
+import logging
+import pytz
+from datetime import datetime, time as dtime
+from dotenv import load_dotenv
+
+# --- Angel One & Custom Modules ---
+from SmartApi import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+import pyotp
+
+import database
+import options_chain_builder
+from strategy_brain import StrategyBrain
+from order_execution import OrderExecutionEngine
+from historical_features import HistoricalFeatureExtractor
+
+# IMPORT THE NEW EXTERNAL CONFIGURATION
+import trading_config
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+class AIFNOBot:
+    def __init__(self):
+        logging.info("Initializing Multi-Index F&O Framework...")
+        
+        load_dotenv()
+        self.api_key = os.getenv("SMARTAPI_KEY")
+        self.client_code = os.getenv("CLIENT_ID")
+        self.password = os.getenv("TRADING_PIN")
+        self.totp_secret = os.getenv("TOTP_SECRET")
+        
+        # --- LOAD DYNAMIC CONFIGURATION ---
+        self.instruments = trading_config.TRADING_INSTRUMENTS
+        
+        self.state = {}
+        self.options_builders = {}
+        
+        # 1. Initialize Database
+        self.db = database.DatabaseManager()
+        
+        # 2. Setup isolated brains and options builders for each symbol
+        for token, info in self.instruments.items():
+            self.state[token] = {
+                "price_history": [],
+                "active_trade": None,
+                "strategy": StrategyBrain() # Independent EMA tracking per index
+            }
+            # Instantiate specific builders based on index name and strike step
+            self.options_builders[token] = options_chain_builder.DynamicOptionsChainBuilder(
+                index_name=info["symbol"], 
+                strike_interval=info["strike_step"]
+            )
+            self.options_builders[token].load_scrip_master()
+        
+        # 3. Authenticate Broker
+        self.smartApi = SmartConnect(api_key=self.api_key)
+        self.authenticate()
+        
+        # 4. Initialize Order Engine (Paper Trade Enabled for Mon-Thu, change to False for Live on Friday)
+        self.order_engine = OrderExecutionEngine(self.smartApi, paper_trading_mode=True)
+        
+        # 5. INSTANT WARMUP (Multi-Symbol)
+        self.warmup_bot()
+
+    def authenticate(self):
+        try:
+            totp = pyotp.TOTP(self.totp_secret).now()
+            session = self.smartApi.generateSession(self.client_code, self.password, totp)
+            if session['status']:
+                self.feed_token = self.smartApi.getfeedToken()
+                self.auth_token = session["data"]["jwtToken"]
+                logging.info("✅ Broker Authentication Validated.")
+            else:
+                logging.error(f"Authentication Failed: {session.get('message')}")
+                sys.exit(1)
+        except Exception as e:
+            logging.error(f"Error during authentication: {e}")
+            sys.exit(1)
+
+    def warmup_bot(self):
+        logging.info("Fetching historical data to instantly prime AI indicators for all indices...")
+        try:
+            extractor = HistoricalFeatureExtractor(self.smartApi)
+            
+            for token, info in self.instruments.items():
+                time.sleep(4)  # 4-second delay to strictly satisfy Angel One API rate limits
+                # Pull 4 days of history to comfortably bridge weekends/holidays
+                df = extractor.fetch_historical_candles(info["exchange"], token, "ONE_MINUTE", days_back=4)
+                
+                if df is not None and not df.empty:
+                    close_col = 'close' if 'close' in df.columns else 'Close' if 'Close' in df.columns else None
+                    if close_col:
+                        historical_closes = df[close_col].dropna().tolist()
+                        for price in historical_closes[-100:]:
+                            self.state[token]["strategy"].update_indicators(price)
+                            self.state[token]["price_history"].append(price)
+                        logging.info(f"✅ {info['symbol']} Brain Warmed Up: Loaded {len(historical_closes[-100:])} ticks!")
+                    else:
+                        logging.warning(f"⚠️ {info['symbol']} Warmup skipped: No 'close' column found.")
+                else:
+                    logging.warning(f"⚠️ {info['symbol']} Warmup skipped: Historical fetch returned empty.")
+        except Exception as e:
+            logging.warning(f"⚠️ Warmup routine skipped due to error: {e}")
+
+    def handle_incoming_tick(self, token, spot_price):
+        token = str(token)
+        if token not in self.state:
+            return
+            
+        ist_tz = pytz.timezone('Asia/Kolkata')
+        now_t = datetime.now(ist_tz).time()
+        
+        symbol_info = self.instruments[token]
+        symbol_state = self.state[token]
+
+        # --- STRICT TIME-BASED VOLATILITY & SQUARE-OFF BLOCKS (TOP PRIORITY) ---
+        
+        # Auto Square-Off Check (15:10 IST)
+        if now_t >= dtime(15, 10):
+            if symbol_state["active_trade"]:
+                logging.info(f"⏰ 15:10 IST Reached. Forcing Auto Square-Off for {symbol_info['symbol']}...")
+                symbol_state["active_trade"] = None
+            return
+
+        # Time-based Volatility Block (Hard block before 09:30 and at/after 14:45)
+        if now_t < dtime(9, 30) or now_t >= dtime(14, 45):
+            return
+
+        # --- TICK PROCESSING & STRATEGY EXECUTION ---
+        symbol_state["price_history"].append(spot_price)
+        if len(symbol_state["price_history"]) > 200:
+            symbol_state["price_history"].pop(0)
+
+        # LIVE EXECUTION BLOCK
+        if not symbol_state["active_trade"]:
+            market_direction = symbol_state["strategy"].analyze_market_state(spot_price)
+            
+            if market_direction in ['BUY_CALL', 'BUY_PUT']:
+                logging.info(f"Signal Generated for {symbol_info['symbol']}: {market_direction}")
+                opt_type = 'CE' if market_direction == 'BUY_CALL' else 'PE'
+                
+                payload = {
+                    'symbol': symbol_info["symbol"],
+                    'qty_lots': symbol_info["lots"], 
+                    'option_type': opt_type,
+                    'spot_price': spot_price,
+                    'options_builder': self.options_builders[token]
+                }
+                symbol_state["active_trade"] = self.order_engine.execute_options_order(payload)
+        else:
+            trade_status = symbol_state["strategy"].manage_open_trade(symbol_state["active_trade"], spot_price)
+            if trade_status == 'CLOSED':
+                symbol_state["active_trade"] = None
+
+    def start_websocket(self):
+        logging.info("Launching core background WebSocket listener...")
+        sws = SmartWebSocketV2(self.auth_token, self.api_key, self.client_code, self.feed_token)
+        
+        def on_data(wsapp, message):
+            if 'last_traded_price' in message and 'token' in message:
+                self.handle_incoming_tick(message['token'], message['last_traded_price'])
+                
+        def on_open(wsapp):
+            logging.info("🔌 WebSocket Data Pipe Connected. Subscribing to dynamic instruments...")
+            
+            nse_tokens = []
+            bse_tokens = []
+            
+            # Dynamically sort tokens by exchange for the WebSocket
+            for token, info in self.instruments.items():
+                if info["exchange"] == "NSE":
+                    nse_tokens.append(token)
+                elif info["exchange"] == "BSE":
+                    bse_tokens.append(token)
+            
+            if nse_tokens:
+                sws.subscribe("task_1", 1, [{"exchangeType": 1, "tokens": nse_tokens}])
+            if bse_tokens:
+                sws.subscribe("task_2", 1, [{"exchangeType": 3, "tokens": bse_tokens}])
+            
+        def on_error(wsapp, error):
+            logging.error(f"WebSocket Error: {error}")
+            
+        def on_close(wsapp, *args):
+            logging.warning("WebSocket Connection Closed.")
+
+        sws.on_open = on_open
+        sws.on_data = on_data
+        sws.on_error = on_error
+        sws.on_close = on_close
+        sws.connect()
+
+if __name__ == "__main__":
+    bot = AIFNOBot()
+    bot.start_websocket()

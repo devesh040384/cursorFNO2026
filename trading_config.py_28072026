@@ -1,0 +1,31 @@
+"""
+TRADING CONFIGURATION FILE
+Modify this file to change lot sizes, strike intervals, or add new indices.
+No changes to main.py are required when updating these values.
+"""
+
+TRADING_INSTRUMENTS = {
+    # NIFTY 50
+    "26000": {
+        "symbol": "NIFTY",
+        "exchange": "NSE",
+        "strike_step": 50,
+        "lots": 1
+    },
+
+    # BANKNIFTY
+    "26009": {
+        "symbol": "BANKNIFTY",
+        "exchange": "NSE",
+        "strike_step": 100,
+        "lots": 1
+    },  # <--- COMMA ADDED HERE
+
+    # SENSEX (Active)
+    "999901": {
+        "symbol": "SENSEX",
+        "exchange": "BSE",
+        "strike_step": 100,
+        "lots": 1
+    }
+}
