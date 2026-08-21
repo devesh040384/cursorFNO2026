@@ -100,13 +100,13 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertFalse(gate.allows_entry("NIFTY"))
         gate.mark_subscribed("NIFTY", True)
         self.assertFalse(gate.allows_entry("NIFTY"))
-        gate.closed_volumes["NIFTY"] = [100] * 19 + [200]
+        gate.closed_volumes["NIFTY"] = [100] * 7 + [200]
         self.assertTrue(gate.allows_entry("NIFTY"))
         # Average volume is enough for RSI hook; 1.2x is only required for breakout.
-        gate.closed_volumes["NIFTY"] = [100] * 20
+        gate.closed_volumes["NIFTY"] = [100] * 8
         self.assertTrue(gate.allows_entry("NIFTY"))
-        self.assertFalse(volume_expanded(gate.closed_volumes["NIFTY"], RISK["volume_mult"], 20))
-        gate.closed_volumes["NIFTY"] = [100] * 19 + [50]
+        self.assertFalse(volume_expanded(gate.closed_volumes["NIFTY"], RISK["volume_mult"], 8))
+        gate.closed_volumes["NIFTY"] = [100] * 7 + [50]
         self.assertFalse(gate.allows_entry("NIFTY"))
 
     def test_scorecard_pnl_uses_stored_qty(self):
@@ -162,7 +162,7 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertTrue(RISK["require_volume_expansion"])
         self.assertTrue(RISK["enable_volume_breakout"])
         self.assertTrue(RISK["enable_volume_breakout_in_chop"])
-        self.assertEqual(RISK["volume_sma_bars"], 20)
+        self.assertEqual(RISK["volume_sma_bars"], 8)
         self.assertEqual(RISK["volume_mult"], 1.2)
         self.assertEqual(RISK["volume_hook_mult"], 1.0)
         self.assertGreaterEqual(RISK["volume_ok_hold_sec"], 60)
@@ -283,6 +283,46 @@ class TestAlgoEngineCore(unittest.TestCase):
         chop = [24250.0 + (8 if i % 2 == 0 else -8) for i in range(40)]
         trend_ch, _, _, _ = brain._classify_regime(chop, cfg)
         self.assertEqual(trend_ch, "CHOPPY")
+
+        # Live 11:09 IST: ema spread 2.8 used to miss the 4.0 min and stay CHOPPY.
+        grind = [24259.0 + i * 0.35 for i in range(30)]
+        grind[-1] = 24265.35
+        live_trend, live_e9, live_e21, _ = brain._classify_regime(grind, cfg)
+        self.assertGreater(live_e9, live_e21)
+        self.assertEqual(live_trend, "BULLISH")
+
+    def test_trend_cont_buys_ce_when_rsi_already_above_50(self):
+        class FakeAPI:
+            def ltpData(self, *a, **k):
+                return {"status": True, "data": {"ltp": 100.0}}
+
+        class FakeOM:
+            def __init__(self):
+                self.calls = []
+                self.smart_api = FakeAPI()
+
+            def execute_entry(self, **kwargs):
+                self.calls.append(kwargs)
+                return "oid"
+
+        class FakeBuilder:
+            def get_nearest_expiry_contract(self, spot, instrument_type="CE"):
+                return {"symbol": "NIFTYCE", "token": "1", "lotsize": 65, "exchange": "NFO"}
+
+        om = FakeOM()
+        brain = StrategyBrain(
+            order_engine=om,
+            options_builders={"26000": FakeBuilder()},
+            db_manager=None,
+        )
+        brain.volume_gate.mark_subscribed("NIFTY", True)
+        brain.volume_gate.closed_volumes["NIFTY"] = [100] * 8
+        cfg = INDICES_CONFIG["NIFTY"]
+        fired = brain._try_trend_entries(
+            "NIFTY", 24265.0, 24262.0, "BULLISH", cfg, last_rsi=61.0, current_rsi=61.5
+        )
+        self.assertTrue(fired)
+        self.assertEqual(om.calls[0]["entry_reason"], "TREND_CONT")
 
 
 if __name__ == "__main__":

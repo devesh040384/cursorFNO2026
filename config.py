@@ -26,11 +26,12 @@ RISK = {
     "require_volume_expansion": True,
     "enable_volume_breakout": True,
     "enable_volume_breakout_in_chop": True,
-    "volume_sma_bars": 20,
+    "volume_sma_bars": 8,
     # 1-min futures: 1.5x almost never prints; breakout uses volume_mult, RSI hook uses hook_mult
     "volume_mult": 1.2,
     "volume_hook_mult": 1.0,
     "volume_ok_hold_sec": 180,
+    "trend_cont_rsi_max": 68.0,
 }
 
 # Fallback lot sizes if scrip master omits lotsize (must match current NSE/BSE lots)
@@ -48,8 +49,8 @@ INDICES_CONFIG = {
         "option_exchange": "NFO",
         "fut_exchange_type": 2,
         "symbol": "NIFTY",
-        "vwap_buffer": 4.0,
-        "ema_spread_min": 4.0,
+        "vwap_buffer": 2.0,
+        "ema_spread_min": 1.0,
         "regime_mean_bars": 20,
         # Tighter than original 15%/50%: smaller loss, realistic option target
         "trending_sl_mult": 0.90,       # 10% stop
@@ -64,8 +65,8 @@ INDICES_CONFIG = {
         "option_exchange": "BFO",
         "fut_exchange_type": 4,
         "symbol": "SENSEX",
-        "vwap_buffer": 12.0,
-        "ema_spread_min": 10.0,
+        "vwap_buffer": 8.0,
+        "ema_spread_min": 6.0,
         "regime_mean_bars": 20,
         "trending_sl_mult": 0.90,
         "trending_target_mult": 1.22,
