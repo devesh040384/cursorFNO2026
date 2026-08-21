@@ -26,7 +26,10 @@ RISK = {
     "require_volume_expansion": True,
     "enable_volume_breakout": True,
     "volume_sma_bars": 20,
-    "volume_mult": 1.5,
+    # 1-min futures: 1.5x almost never prints; breakout uses volume_mult, RSI hook uses hook_mult
+    "volume_mult": 1.2,
+    "volume_hook_mult": 1.0,
+    "volume_ok_hold_sec": 180,
 }
 
 # Fallback lot sizes if scrip master omits lotsize (must match current NSE/BSE lots)

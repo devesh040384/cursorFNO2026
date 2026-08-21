@@ -15,25 +15,71 @@ class VolumeExpansionGate:
         self.closed_volumes = {symbol: [] for symbol in INDICES_CONFIG.keys()}
         self.forming_vol = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
         self.last_bar_time = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
+        self.last_bar_minute = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.last_session_vol = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.subscribed = {symbol: False for symbol in INDICES_CONFIG.keys()}
         self.volume_ok = {symbol: False for symbol in INDICES_CONFIG.keys()}
+        self.volume_ok_until = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
         self.breakout_event = {symbol: None for symbol in INDICES_CONFIG.keys()}
+        self.zero_bar_streak = {symbol: 0 for symbol in INDICES_CONFIG.keys()}
 
     def mark_subscribed(self, symbol, ok=True):
         self.subscribed[symbol] = bool(ok)
         if not ok:
             self.volume_ok[symbol] = False
+            self.volume_ok_until[symbol] = 0.0
             self.breakout_event[symbol] = None
+
+    def rvol(self, symbol):
+        hist = self.closed_volumes.get(symbol) or []
+        sma_bars = int(RISK.get("volume_sma_bars", 20))
+        if len(hist) < sma_bars:
+            return None
+        window = [float(v) for v in hist[-sma_bars:]]
+        prior = window[:-1]
+        if not prior:
+            return None
+        avg = sum(prior) / len(prior)
+        if avg <= 0:
+            return 0.0
+        return window[-1] / avg
+
+    def snapshot(self, symbol):
+        hist = self.closed_volumes.get(symbol) or []
+        need = int(RISK.get("volume_sma_bars", 20))
+        rv = self.rvol(symbol)
+        ok = self.allows_entry(symbol)
+        if not self.subscribed.get(symbol):
+            reason = "no-fut"
+        elif len(hist) < need:
+            reason = f"warmup {len(hist)}/{need}"
+        elif rv is not None and rv <= 0:
+            reason = "vol-feed-zero"
+        elif not ok:
+            reason = f"rvol {rv:.2f}x" if rv is not None else "low-vol"
+        else:
+            reason = "ready"
+        return {
+            "bars": len(hist),
+            "need": need,
+            "rvol": rv,
+            "ok": ok,
+            "reason": reason,
+        }
 
     def allows_entry(self, symbol):
         if not RISK.get("require_volume_expansion", True):
             return True
         if not self.subscribed.get(symbol):
             return False
-        return bool(self.volume_ok.get(symbol))
+        if time.time() < float(self.volume_ok_until.get(symbol) or 0.0):
+            return True
+        rv = self.rvol(symbol)
+        if rv is None:
+            return False
+        return rv >= float(RISK.get("volume_hook_mult", 1.0))
 
-    def consume_breakout(self, symbol, max_age_sec=90.0):
+    def consume_breakout(self, symbol, max_age_sec=180.0):
         """Return True once for a fresh expansion; clears the event."""
         ts = self.breakout_event.get(symbol)
         self.breakout_event[symbol] = None
@@ -41,12 +87,52 @@ class VolumeExpansionGate:
             return False
         return (time.time() - float(ts)) <= max_age_sec
 
+    def _close_volume_bar(self, symbol, now, increment):
+        closed = self.forming_vol[symbol]
+        hist = self.closed_volumes[symbol]
+        hist.append(closed)
+        if len(hist) > 80:
+            hist.pop(0)
+        self.closed_volumes[symbol] = hist
+
+        if closed <= 0:
+            self.zero_bar_streak[symbol] = self.zero_bar_streak.get(symbol, 0) + 1
+            if self.zero_bar_streak[symbol] == 5:
+                logging.warning(
+                    f"[{symbol}] 1-min futures volume is 0 for 5 bars. "
+                    "Quote feed may be missing volume fields; entries stay blocked."
+                )
+        else:
+            self.zero_bar_streak[symbol] = 0
+
+        expanded = volume_expanded(
+            hist,
+            mult=float(RISK.get("volume_mult", 1.2)),
+            sma_bars=int(RISK.get("volume_sma_bars", 20)),
+        )
+        self.volume_ok[symbol] = expanded
+        if expanded:
+            self.breakout_event[symbol] = now
+            hold = float(RISK.get("volume_ok_hold_sec", 180))
+            self.volume_ok_until[symbol] = now + hold
+        rv = self.rvol(symbol)
+        rv_s = f"{rv:.2f}x" if rv is not None else "n/a"
+        logging.info(
+            f"📊 [{symbol} 1M VOL] last={closed:.0f} rvol={rv_s} "
+            f"bars={len(hist)}/{int(RISK.get('volume_sma_bars', 20))} "
+            f"breakout={expanded} hook={self.allows_entry(symbol)}"
+        )
+        self.forming_vol[symbol] = increment
+        self.last_bar_time[symbol] = now
+
     def on_fut_tick(self, symbol, volume_traded_today=None, last_traded_qty=None):
         if symbol not in INDICES_CONFIG:
             return
         now = time.time()
+        minute = int(now // 60)
         if self.last_bar_time[symbol] == 0.0:
             self.last_bar_time[symbol] = now
+            self.last_bar_minute[symbol] = minute
 
         increment = 0.0
         if volume_traded_today is not None:
@@ -57,26 +143,18 @@ class VolumeExpansionGate:
             else:
                 increment = max(0.0, current - prev)
             self.last_session_vol[symbol] = current
+            # Session cumulative often stalls on a tick; last trade qty still moves.
+            if increment == 0.0 and last_traded_qty is not None:
+                increment = max(0.0, float(last_traded_qty))
         elif last_traded_qty is not None:
             increment = max(0.0, float(last_traded_qty))
 
-        if now - self.last_bar_time[symbol] >= 60:
-            closed = self.forming_vol[symbol]
-            hist = self.closed_volumes[symbol]
-            hist.append(closed)
-            if len(hist) > 80:
-                hist.pop(0)
-            self.closed_volumes[symbol] = hist
-            expanded = volume_expanded(
-                hist,
-                mult=float(RISK.get("volume_mult", 1.5)),
-                sma_bars=int(RISK.get("volume_sma_bars", 20)),
-            )
-            self.volume_ok[symbol] = expanded
-            if expanded:
-                self.breakout_event[symbol] = now
-            self.forming_vol[symbol] = increment
-            self.last_bar_time[symbol] = now
+        last_minute = self.last_bar_minute[symbol]
+        clock_rolled = last_minute is not None and minute != last_minute
+        elapsed_rolled = now - self.last_bar_time[symbol] >= 60
+        if clock_rolled or elapsed_rolled:
+            self._close_volume_bar(symbol, now, increment)
+            self.last_bar_minute[symbol] = minute
         else:
             self.forming_vol[symbol] += increment
 

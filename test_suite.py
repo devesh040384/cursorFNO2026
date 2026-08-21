@@ -92,6 +92,8 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertFalse(volume_expanded([100] * 20, 1.5, 20))
         self.assertTrue(volume_expanded([100] * 19 + [151], 1.5, 20))
         self.assertFalse(volume_expanded([100] * 19 + [149], 1.5, 20))
+        self.assertTrue(volume_expanded([100] * 19 + [120], 1.2, 20))
+        self.assertFalse(volume_expanded([100] * 19 + [119], 1.2, 20))
 
     def test_volume_gate_fail_closed_until_subscribe_and_bars(self):
         gate = VolumeExpansionGate()
@@ -99,8 +101,13 @@ class TestAlgoEngineCore(unittest.TestCase):
         gate.mark_subscribed("NIFTY", True)
         self.assertFalse(gate.allows_entry("NIFTY"))
         gate.closed_volumes["NIFTY"] = [100] * 19 + [200]
-        gate.volume_ok["NIFTY"] = volume_expanded(gate.closed_volumes["NIFTY"], 1.5, 20)
         self.assertTrue(gate.allows_entry("NIFTY"))
+        # Average volume is enough for RSI hook; 1.2x is only required for breakout.
+        gate.closed_volumes["NIFTY"] = [100] * 20
+        self.assertTrue(gate.allows_entry("NIFTY"))
+        self.assertFalse(volume_expanded(gate.closed_volumes["NIFTY"], RISK["volume_mult"], 20))
+        gate.closed_volumes["NIFTY"] = [100] * 19 + [50]
+        self.assertFalse(gate.allows_entry("NIFTY"))
 
     def test_scorecard_pnl_uses_stored_qty(self):
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -155,7 +162,31 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertTrue(RISK["require_volume_expansion"])
         self.assertTrue(RISK["enable_volume_breakout"])
         self.assertEqual(RISK["volume_sma_bars"], 20)
-        self.assertEqual(RISK["volume_mult"], 1.5)
+        self.assertEqual(RISK["volume_mult"], 1.2)
+        self.assertEqual(RISK["volume_hook_mult"], 1.0)
+        self.assertGreaterEqual(RISK["volume_ok_hold_sec"], 60)
+
+    def test_volume_gate_ltq_fallback_and_sticky_hold(self):
+        import time as time_mod
+
+        gate = VolumeExpansionGate()
+        gate.mark_subscribed("NIFTY", True)
+        now = time_mod.time()
+        gate.last_bar_time["NIFTY"] = now
+        gate.last_bar_minute["NIFTY"] = int(now // 60)
+        gate.last_session_vol["NIFTY"] = 1000.0
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0)
+        self.assertEqual(gate.forming_vol["NIFTY"], 12.0)
+
+        gate.forming_vol["NIFTY"] = 80.0
+        gate.last_bar_time["NIFTY"] = now - 61
+        gate.last_bar_minute["NIFTY"] = int(now // 60) - 1
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=4.0)
+        self.assertEqual(gate.closed_volumes["NIFTY"][-1], 80.0)
+
+        gate.volume_ok_until["NIFTY"] = time_mod.time() + 60
+        gate.closed_volumes["NIFTY"] = [100] * 19 + [50]
+        self.assertTrue(gate.allows_entry("NIFTY"))
 
     def test_volume_breakout_consume_once_and_skip_choppy(self):
         import time as time_mod
