@@ -1,4 +1,7 @@
-# Live/paper SQLite — never overwrite on git pull
+# Live credentials — never commit
+.env
+__pycache__/
+
 trade_history.db
 **/trade_history.db
 trade_history.db-wal

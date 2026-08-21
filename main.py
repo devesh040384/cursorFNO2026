@@ -149,6 +149,7 @@ class EndOfDaySquareOffMonitor(threading.Thread):
                         self.has_squared_off_today = True
                         continue
 
+                    failed = 0
                     for trade in open_trades:
                         trade_id = _row_get(trade, "id", 0)
                         symbol = _row_get(trade, "symbol", 1)
@@ -162,6 +163,13 @@ class EndOfDaySquareOffMonitor(threading.Thread):
                         except Exception as e:
                             logging.error(f"❌ [KILL SWITCH] Could not fetch LTP for {symbol}: {e}")
 
+                        if exit_price <= 0:
+                            logging.error(
+                                f"❌ [KILL SWITCH] No LTP for {symbol}; left OPEN for retry."
+                            )
+                            failed += 1
+                            continue
+
                         ok = self.order_engine.execute_exit(
                             trade_id, symbol, token, qty, exchange, exit_price, reason="EOD_SQUAREOFF"
                         )
@@ -169,8 +177,14 @@ class EndOfDaySquareOffMonitor(threading.Thread):
                             logging.info(f"🛑 [KILL SWITCH] Closed {symbol} at ~₹{exit_price}")
                         else:
                             logging.error(f"❌ [KILL SWITCH] Exit failed for {symbol}; left OPEN")
+                            failed += 1
 
-                    self.has_squared_off_today = True
+                    if failed == 0:
+                        self.has_squared_off_today = True
+                    else:
+                        logging.warning(
+                            f"⏰ [KILL SWITCH] {failed} OPEN trade(s) not squared; will retry."
+                        )
             except Exception as e:
                 logging.error(f"❌ Error in EOD Square Off Monitor: {e}")
 
@@ -337,7 +351,11 @@ def main():
                 auth_token=access_token,
                 api_key=api_key,
                 client_code=client_code,
-                feed_token=feed_token
+                feed_token=feed_token,
+                max_retry_attempt=10,
+                retry_strategy=1,
+                retry_delay=5,
+                retry_multiplier=2,
             )
             
             last_log_per_token = {}
@@ -388,7 +406,12 @@ def main():
                         idx = fut_token_to_index[token]
                         vt = float(vol_today) if vol_today is not None else None
                         lq = float(last_qty) if last_qty is not None else None
-                        strategy_brain.volume_gate.on_fut_tick(idx, volume_traded_today=vt, last_traded_qty=lq)
+                        strategy_brain.volume_gate.on_fut_tick(
+                            idx,
+                            volume_traded_today=vt,
+                            last_traded_qty=lq,
+                            sequence_number=message.get("sequence_number"),
+                        )
                     
                     if ltp_raw is not None:
                         spot_price = float(ltp_raw) / 100.0 if float(ltp_raw) > 1000000 else float(ltp_raw)
@@ -419,10 +442,10 @@ def main():
                         exch_type = 3 if exch_str == "BSE" else 1
                     token_list.append({"exchangeType": exch_type, "tokens": [str(cfg["index_token"])]})
                 
-                sws.subscribe("corrid_multindex", 1, token_list)
+                sws.subscribe("idx_ltp01", 1, token_list)
                 logging.info(f"📡 Subscribed to indices: {ACTIVE_INDICES} with payload: {token_list}")
                 if fut_subscriptions:
-                    sws.subscribe("corrid_futures_vol", 2, fut_subscriptions)
+                    sws.subscribe("fut_vol01", 2, fut_subscriptions)
                     logging.info(f"📡 Subscribed to index futures (quote/volume): {fut_subscriptions}")
                 elif RISK.get("require_volume_expansion", True):
                     logging.error("No futures subscriptions; volume gate will block entries.")
@@ -440,8 +463,18 @@ def main():
             sws.on_close = on_close
 
             logging.info("Launching core live WebSocket market data stream...")
-            
-            ws_thread = threading.Thread(target=sws.connect)
+
+            def ws_loop():
+                while True:
+                    try:
+                        sws.current_retry_attempt = 0
+                        sws.connect()
+                    except Exception as e:
+                        logging.error(f"❌ WebSocket connect crashed: {e}")
+                    logging.warning("⚠️ WebSocket loop ended; reconnecting in 10s.")
+                    time.sleep(10)
+
+            ws_thread = threading.Thread(target=ws_loop)
             ws_thread.daemon = True
             ws_thread.start()
 
