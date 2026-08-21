@@ -9,9 +9,8 @@ if ! python3 -m venv /tmp/_venv_probe 2>/dev/null; then
 fi
 rm -rf /tmp/_venv_probe
 
-if [[ ! -d venv ]] || [[ ! -x venv/bin/python ]]; then
-  python3 -m venv venv
-fi
+rm -rf venv
+python3 -m venv venv
 
 ./venv/bin/pip install --upgrade pip
 ./venv/bin/pip install -r requirements.txt
