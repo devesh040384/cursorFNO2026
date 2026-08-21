@@ -32,6 +32,8 @@ RISK = {
     "volume_hook_mult": 1.0,
     "volume_ok_hold_sec": 180,
     "trend_cont_rsi_max": 68.0,
+    "min_option_volume": 500.0,
+    "max_option_spread_pct": 3.0,
 }
 
 # Fallback lot sizes if scrip master omits lotsize (must match current NSE/BSE lots)

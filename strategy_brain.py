@@ -79,6 +79,15 @@ class VolumeExpansionGate:
             return False
         return rv >= float(RISK.get("volume_hook_mult", 1.0))
 
+    def has_fresh_breakout(self, symbol, max_age_sec=180.0):
+        ts = self.breakout_event.get(symbol)
+        if ts is None:
+            return False
+        if (time.time() - float(ts)) > max_age_sec:
+            self.breakout_event[symbol] = None
+            return False
+        return True
+
     def consume_breakout(self, symbol, max_age_sec=180.0):
         """Return True once for a fresh expansion; clears the event."""
         ts = self.breakout_event.get(symbol)
@@ -312,29 +321,33 @@ class StrategyBrain:
     def _try_volume_breakout(self, symbol, last_close, prev_close, macro_trend, config):
         if not RISK.get("enable_volume_breakout", True):
             return False
-        if not self.volume_gate.consume_breakout(symbol):
+        if not self.volume_gate.has_fresh_breakout(symbol):
             return False
         up_bar = last_close > prev_close
         down_bar = last_close < prev_close
         allow_chop = RISK.get("enable_volume_breakout_in_chop", True)
-        if (macro_trend == "BULLISH" or (macro_trend == "CHOPPY" and allow_chop)) and up_bar:
-            logging.info(f"[{symbol}] VOLUME_BREAKOUT up-bar ({macro_trend}). Buying CE.")
-            return self._trigger_entry(
-                symbol, last_close, "CE",
-                config["trending_target_mult"], config["trending_sl_mult"],
-                entry_reason="VOLUME_BREAKOUT",
+        want_ce = (macro_trend == "BULLISH" or (macro_trend == "CHOPPY" and allow_chop)) and up_bar
+        want_pe = (macro_trend == "BEARISH" or (macro_trend == "CHOPPY" and allow_chop)) and down_bar
+        if not want_ce and not want_pe:
+            self.volume_gate.consume_breakout(symbol)
+            logging.info(
+                f"[{symbol}] VOLUME_BREAKOUT skipped: bar direction does not match {macro_trend}."
             )
-        if (macro_trend == "BEARISH" or (macro_trend == "CHOPPY" and allow_chop)) and down_bar:
-            logging.info(f"[{symbol}] VOLUME_BREAKOUT down-bar ({macro_trend}). Buying PE.")
-            return self._trigger_entry(
-                symbol, last_close, "PE",
-                config["trending_target_mult"], config["trending_sl_mult"],
-                entry_reason="VOLUME_BREAKOUT",
-            )
-        logging.info(
-            f"[{symbol}] VOLUME_BREAKOUT skipped: bar direction does not match {macro_trend}."
+            return False
+        side = "CE" if want_ce else "PE"
+        logging.info(f"[{symbol}] VOLUME_BREAKOUT {'up' if want_ce else 'down'}-bar ({macro_trend}). Buying {side}.")
+        ok = self._trigger_entry(
+            symbol, last_close, side,
+            config["trending_target_mult"], config["trending_sl_mult"],
+            entry_reason="VOLUME_BREAKOUT",
         )
-        return False
+        if ok:
+            self.volume_gate.consume_breakout(symbol)
+        else:
+            logging.warning(
+                f"[{symbol}] VOLUME_BREAKOUT {side} not filled; keeping event for retry."
+            )
+        return bool(ok)
 
     def _try_trend_entries(self, symbol, last_close, prev_close, macro_trend, config, last_rsi, current_rsi):
         recent_rsis = self.closed_rsi.get(symbol, [])

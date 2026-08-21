@@ -2,7 +2,7 @@ import logging
 import json
 import os
 from datetime import datetime
-from config import FALLBACK_LOT_SIZE
+from config import FALLBACK_LOT_SIZE, RISK
 
 
 class DynamicOptionsChainBuilder:
@@ -121,6 +121,88 @@ class DynamicOptionsChainBuilder:
             logging.error(f"❌ Error resolving future for {self.index_name}: {e}")
             return None
 
+    @staticmethod
+    def _level_price(levels):
+        if not levels or not isinstance(levels, list):
+            return None
+        row = levels[0]
+        raw = row.get("price") if isinstance(row, dict) else row
+        try:
+            px = float(raw)
+            return px if px > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _quote_row(q_resp):
+        payload = (q_resp or {}).get("data") if isinstance(q_resp, dict) else None
+        if isinstance(payload, dict):
+            fetched = payload.get("fetched")
+            if isinstance(fetched, list) and fetched:
+                return fetched[0] if isinstance(fetched[0], dict) else {}
+            return payload
+        if isinstance(payload, list) and payload:
+            return payload[0] if isinstance(payload[0], dict) else {}
+        return {}
+
+    @staticmethod
+    def _bid_ask(q_data, ltp):
+        depth = q_data.get("depth") if isinstance(q_data.get("depth"), dict) else {}
+        bid = DynamicOptionsChainBuilder._level_price(depth.get("buy") or depth.get("Buy"))
+        ask = DynamicOptionsChainBuilder._level_price(depth.get("sell") or depth.get("Sell"))
+        if bid is None:
+            for key in ("bestBidPrice", "bidPrice", "best_bid_price"):
+                raw = q_data.get(key)
+                if raw not in (None, "", 0, "0"):
+                    bid = float(raw)
+                    break
+        if ask is None:
+            for key in ("bestAskPrice", "askPrice", "best_ask_price"):
+                raw = q_data.get(key)
+                if raw not in (None, "", 0, "0"):
+                    ask = float(raw)
+                    break
+        return bid, ask
+
+    @staticmethod
+    def _session_volume(q_data):
+        for key in ("tradeVolume", "volume", "opVolume", "totQtyTraded", "lastTradeQty"):
+            raw = q_data.get(key)
+            if raw not in (None, ""):
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    def _liquidity_ok(self, q_data, ltp, symbol):
+        min_vol = float(RISK.get("min_option_volume", 500.0))
+        max_spread = float(RISK.get("max_option_spread_pct", 3.0))
+        volume = self._session_volume(q_data)
+        bid, ask = self._bid_ask(q_data, ltp)
+        if volume < min_vol:
+            logging.warning(
+                f"[LIQUIDITY REJECTED] {symbol} (Vol: {volume}, Spread: n/a) — below min volume"
+            )
+            return False
+        if bid and ask and ltp > 0 and ask >= bid:
+            spread_pct = ((ask - bid) / ltp) * 100.0
+            if spread_pct <= max_spread:
+                logging.info(
+                    f"[LIQUIDITY PASSED] {symbol} | Vol: {volume} | Spread: {spread_pct:.2f}% "
+                    f"| bid {bid} ask {ask}"
+                )
+                return True
+            logging.warning(
+                f"[LIQUIDITY REJECTED] {symbol} (Vol: {volume}, Spread: {spread_pct:.2f}%)"
+            )
+            return False
+        # SmartAPI FULL often has no bestBidPrice; do not invent ltp±1% (that is always 2%).
+        logging.info(
+            f"[LIQUIDITY PASSED] {symbol} | Vol: {volume} | Spread: n/a (no depth, volume-only)"
+        )
+        return True
+
     def get_nearest_expiry_contract(self, spot_price, instrument_type="CE"):
         """Nearest-expiry ATM option. Returns None if liquidity cannot be verified."""
         try:
@@ -190,20 +272,17 @@ class DynamicOptionsChainBuilder:
                         mode="FULL", exchangeTokens={exchange: [str(contract_token)]}
                     )
                     if not (q_resp and q_resp.get("status")):
+                        if ltp > 0:
+                            logging.info(
+                                f"[LIQUIDITY PASSED] {contract_symbol} | LTP-only (quote fetch failed)"
+                            )
+                            return packed
                         continue
-                    q_data = (q_resp.get("data") or {}).get("fetched", [{}])[0]
-                    volume = float(q_data.get("tradeVolume", 0) or 0)
-                    best_bid = float(q_data.get("bestBidPrice") or ltp * 0.99)
-                    best_ask = float(q_data.get("bestAskPrice") or ltp * 1.01)
-                    spread_pct = ((best_ask - best_bid) / ltp) * 100 if ltp > 0 else 99.0
-                    if volume >= 500 and spread_pct <= 1.5:
-                        logging.info(
-                            f"[LIQUIDITY PASSED] {contract_symbol} | Vol: {volume} | Spread: {spread_pct:.2f}% | lot {packed['lotsize']}"
-                        )
+                    q_data = self._quote_row(q_resp)
+                    if self._liquidity_ok(q_data, ltp, contract_symbol):
+                        if packed["lotsize"] <= 0:
+                            continue
                         return packed
-                    logging.warning(
-                        f"[LIQUIDITY REJECTED] {contract_symbol} (Vol: {volume}, Spread: {spread_pct:.2f}%)"
-                    )
                 except Exception as ex:
                     logging.warning(f"Could not verify depth for {contract_symbol}: {ex}")
                     continue

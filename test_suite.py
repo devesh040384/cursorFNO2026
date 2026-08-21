@@ -246,6 +246,40 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertEqual(om.calls[-1]["entry_reason"], "VOLUME_BREAKOUT")
         self.assertEqual(len(om.calls), 2)
 
+        class EmptyBuilder:
+            def get_nearest_expiry_contract(self, spot, instrument_type="CE"):
+                return None
+
+        brain.options_builders = {"26000": EmptyBuilder()}
+        gate.breakout_event["NIFTY"] = time_mod.time()
+        missed = brain._try_volume_breakout("NIFTY", 99.0, 100.0, "CHOPPY", cfg)
+        self.assertFalse(missed)
+        self.assertIsNotNone(gate.breakout_event["NIFTY"])
+
+    def test_liquidity_does_not_invent_2pct_spread(self):
+        builder = DynamicOptionsChainBuilder(index_name="NIFTY", smart_api=None)
+        q_data = {"tradeVolume": 202909525.0}
+        self.assertTrue(builder._liquidity_ok(q_data, 80.0, "NIFTY25AUG2624250PE"))
+        deep = {
+            "tradeVolume": 10000,
+            "depth": {
+                "buy": [{"price": 79.5, "quantity": 10}],
+                "sell": [{"price": 80.5, "quantity": 10}],
+            },
+        }
+        self.assertTrue(builder._liquidity_ok(deep, 80.0, "NIFTYPE"))
+        wide = {
+            "tradeVolume": 10000,
+            "depth": {
+                "buy": [{"price": 70.0}],
+                "sell": [{"price": 90.0}],
+            },
+        }
+        self.assertFalse(builder._liquidity_ok(wide, 80.0, "NIFTYPE"))
+        bid, ask = builder._bid_ask(deep, 80.0)
+        self.assertEqual(bid, 79.5)
+        self.assertEqual(ask, 80.5)
+
     def test_scorecard_by_entry_reason(self):
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
