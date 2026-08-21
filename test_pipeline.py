@@ -1,19 +1,23 @@
+import os
 import sys
 import pyotp
 import logging
+from dotenv import load_dotenv
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
-# 1. Logging Setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# 2. Hardcoded Authentication Credentials (Keep these updated for your new EC2 instance)
-API_KEY = "TOOPDila"
-CLIENT_ID = "D65235"       
-PASSWORD = "1204"       
-TOTP_SECRET = "SJY4JK4LERJNTX3YVFSTAA465I"
+load_dotenv()
+API_KEY = os.getenv("SMART_API_KEY") or os.getenv("SMARTAPI_KEY")
+CLIENT_ID = os.getenv("CLIENT_ID")
+PASSWORD = os.getenv("PASSWORD") or os.getenv("PIN")
+TOTP_SECRET = os.getenv("TOTP_SECRET")
 
 def run_trading_pipeline():
+    if not all([API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET]):
+        logging.error("❌ Missing SMART_API_KEY / CLIENT_ID / PASSWORD / TOTP_SECRET in .env")
+        sys.exit(1)
+
     logging.info("Step 1: Commencing Angel One login authentication sequence...")
     
     # Initialize connection client

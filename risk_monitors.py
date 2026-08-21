@@ -169,9 +169,9 @@ class TradeReconciler:
                 trade_id = _row_get(trade, "id", 0)
                 symbol = _row_get(trade, "symbol", 1)
                 if symbol not in active_symbols:
-                    self.db.close_trade(trade_id, 0.0, "RECONCILED_CLOSED")
                     logging.warning(
-                        f"[RECONCILIATION] {symbol} (ID: {trade_id}) closed externally at broker."
+                        f"[RECONCILIATION] {symbol} (ID: {trade_id}) missing at broker; "
+                        "leaving OPEN until LTP square-off (will not book ₹0)."
                     )
         except Exception as e:
             logging.error(f"❌ Error during trade reconciliation: {e}")

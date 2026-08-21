@@ -118,6 +118,11 @@ class OrderExecutionEngine:
             f"⚙️ EXIT SELL {qty}x {symbol} ({exchange}) | reason={reason} | Paper={self.paper_trading}"
         )
         fill_price = price if price > 0 else self._fetch_ltp(exchange, symbol, token, price)
+        if fill_price <= 0:
+            logging.error(
+                f"❌ Refusing exit for {symbol} at ₹{fill_price} ({reason}); leaving OPEN."
+            )
+            return False
 
         if self.paper_trading:
             time.sleep(0.05)

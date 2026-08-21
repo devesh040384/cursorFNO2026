@@ -3,6 +3,8 @@ import pandas as pd
 from datetime import datetime
 import os
 
+from config import FALLBACK_LOT_SIZE
+
 DB_PATH = 'trade_history.db'
 
 def generate_daily_summary():
@@ -14,7 +16,7 @@ def generate_daily_summary():
         conn = sqlite3.connect(DB_PATH)
         query = """
             SELECT 
-                id, symbol, token, entry_price, exit_price, target_price,
+                id, symbol, token, qty, entry_price, exit_price, target_price,
                 stop_loss_price, peak_price, status, exit_reason,
                 timestamp AS entry_time, exit_time
             FROM trades
@@ -67,11 +69,17 @@ def generate_daily_summary():
             reason = row['exit_reason'] or 'OPEN'
             symbol = str(row['symbol'])
             
-            # Determine correct lot size dynamically based on Symbol
-            lot_size = 1
-            if symbol.startswith('BANKNIFTY'): lot_size = 15
-            elif symbol.startswith('NIFTY'): lot_size = 25
-            elif symbol.startswith('SENSEX'): lot_size = 10
+            qty_raw = row['qty'] if 'qty' in today_df.columns else None
+            if pd.notnull(qty_raw) and qty_raw:
+                lot_size = int(qty_raw)
+            elif symbol.startswith('BANKNIFTY'):
+                lot_size = FALLBACK_LOT_SIZE["BANKNIFTY"]
+            elif symbol.startswith('NIFTY'):
+                lot_size = FALLBACK_LOT_SIZE["NIFTY"]
+            elif symbol.startswith('SENSEX'):
+                lot_size = FALLBACK_LOT_SIZE["SENSEX"]
+            else:
+                lot_size = FALLBACK_LOT_SIZE["NIFTY"]
             
             if status == 'CLOSED' and entry_p > 0:
                 # Percentage PnL

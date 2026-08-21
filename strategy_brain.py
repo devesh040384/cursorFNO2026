@@ -9,7 +9,7 @@ from indicators import wilder_rsi, volume_expanded
 
 
 class VolumeExpansionGate:
-    """1-minute futures volume vs SMA. Fail closed until 20 bars and a live subscribe."""
+    """1-minute futures volume vs SMA. Fail closed until sma_bars and a live subscribe."""
 
     def __init__(self):
         self.closed_volumes = {symbol: [] for symbol in INDICES_CONFIG.keys()}
@@ -22,6 +22,8 @@ class VolumeExpansionGate:
         self.volume_ok_until = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
         self.breakout_event = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.zero_bar_streak = {symbol: 0 for symbol in INDICES_CONFIG.keys()}
+        self.last_seq = {symbol: None for symbol in INDICES_CONFIG.keys()}
+        self.last_tick_sig = {symbol: None for symbol in INDICES_CONFIG.keys()}
 
     def mark_subscribed(self, symbol, ok=True):
         self.subscribed[symbol] = bool(ok)
@@ -134,7 +136,7 @@ class VolumeExpansionGate:
         self.forming_vol[symbol] = increment
         self.last_bar_time[symbol] = now
 
-    def on_fut_tick(self, symbol, volume_traded_today=None, last_traded_qty=None):
+    def on_fut_tick(self, symbol, volume_traded_today=None, last_traded_qty=None, sequence_number=None):
         if symbol not in INDICES_CONFIG:
             return
         now = time.time()
@@ -142,6 +144,16 @@ class VolumeExpansionGate:
         if self.last_bar_time[symbol] == 0.0:
             self.last_bar_time[symbol] = now
             self.last_bar_minute[symbol] = minute
+
+        if sequence_number is not None:
+            if sequence_number == self.last_seq.get(symbol):
+                return
+            self.last_seq[symbol] = sequence_number
+        else:
+            sig = (volume_traded_today, last_traded_qty)
+            if sig == self.last_tick_sig.get(symbol) and sig != (None, None):
+                return
+        self.last_tick_sig[symbol] = (volume_traded_today, last_traded_qty)
 
         increment = 0.0
         if volume_traded_today is not None:

@@ -358,6 +358,40 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertTrue(fired)
         self.assertEqual(om.calls[0]["entry_reason"], "TREND_CONT")
 
+    def test_duplicate_fut_ticks_do_not_inflate_volume(self):
+        gate = VolumeExpansionGate()
+        gate.mark_subscribed("NIFTY", True)
+        gate.last_bar_time["NIFTY"] = 1.0
+        gate.last_bar_minute["NIFTY"] = 1
+        gate.last_session_vol["NIFTY"] = 1000.0
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0, sequence_number=10)
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0, sequence_number=10)
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0)
+        self.assertEqual(gate.forming_vol["NIFTY"], 12.0)
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0, sequence_number=11)
+        self.assertEqual(gate.forming_vol["NIFTY"], 24.0)
+
+    def test_paper_exit_refuses_zero_fill(self):
+        class DummyAPI:
+            def ltpData(self, *a, **k):
+                return {"status": True, "data": {"ltp": 0.0}}
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            db = DatabaseManager(path)
+            eng = OrderExecutionEngine(DummyAPI(), db, paper_trading=True)
+            oid = eng.execute_entry(
+                "NIFTY26AUG24500CE", "123", 65, "NFO", 120.0, 146.4, 108.0, index_name="NIFTY"
+            )
+            self.assertTrue(oid)
+            row = db.fetch_one("SELECT id FROM trades WHERE status = 'OPEN'")
+            ok = eng.execute_exit(row["id"], "NIFTY26AUG24500CE", "123", 65, "NFO", 0.0, reason="EOD_SQUAREOFF")
+            self.assertFalse(ok)
+            self.assertEqual(db.count_open_trades(), 1)
+        finally:
+            os.remove(path)
+
 
 if __name__ == "__main__":
     unittest.main()

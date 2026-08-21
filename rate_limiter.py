@@ -19,13 +19,11 @@ class RateLimitedAPI:
                     now = time.time()
                     elapsed = now - self.last_call
                     if elapsed < self.delay:
-                        sleep_time = self.delay - elapsed
-                        time.sleep(sleep_time)
-                    
-                    self.last_call = time.time()
-                
-                # Execute the actual Angel One API call
-                return attr(*args, **kwargs)
+                        time.sleep(self.delay - elapsed)
+                    try:
+                        return attr(*args, **kwargs)
+                    finally:
+                        self.last_call = time.time()
             return wrapper
             
         return attr
