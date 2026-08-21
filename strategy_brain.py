@@ -286,23 +286,47 @@ class StrategyBrain:
             logging.error(f"❌ Entry failed for {symbol}: {e}")
             return False
 
+    def _classify_regime(self, closed, config):
+        """EMA + 20-bar mean. Full-session mean kept labels CHOPPY all morning."""
+        ema_9 = self._calculate_ema(closed, 9)
+        ema_21 = self._calculate_ema(closed, 21)
+        lookback = int(config.get("regime_mean_bars", 20))
+        window = closed[-lookback:] if len(closed) >= 2 else closed
+        loc_mean = sum(window) / len(window) if window else 0.0
+        vwap_buffer = float(config.get("vwap_buffer", 4.0))
+        ema_spread_min = float(config.get("ema_spread_min", 4.0))
+        last_close = closed[-1]
+        ema_up = ema_9 > (ema_21 + ema_spread_min)
+        ema_dn = ema_9 < (ema_21 - ema_spread_min)
+        above_mean = last_close > (loc_mean + vwap_buffer)
+        below_mean = last_close < (loc_mean - vwap_buffer)
+        above_fast = last_close >= ema_9
+        below_fast = last_close <= ema_9
+        if ema_up and (above_mean or above_fast):
+            trend = "BULLISH"
+        elif ema_dn and (below_mean or below_fast):
+            trend = "BEARISH"
+        else:
+            trend = "CHOPPY"
+        return trend, ema_9, ema_21, loc_mean
+
     def _try_volume_breakout(self, symbol, last_close, prev_close, macro_trend, config):
         if not RISK.get("enable_volume_breakout", True):
             return False
         if not self.volume_gate.consume_breakout(symbol):
             return False
-        if macro_trend == "CHOPPY":
-            logging.info(f"[{symbol}] VOLUME_BREAKOUT skipped: regime CHOPPY.")
-            return False
-        if macro_trend == "BULLISH" and last_close > prev_close:
-            logging.info(f"[{symbol}] VOLUME_BREAKOUT up-bar in bullish regime. Buying CE.")
+        up_bar = last_close > prev_close
+        down_bar = last_close < prev_close
+        allow_chop = RISK.get("enable_volume_breakout_in_chop", True)
+        if (macro_trend == "BULLISH" or (macro_trend == "CHOPPY" and allow_chop)) and up_bar:
+            logging.info(f"[{symbol}] VOLUME_BREAKOUT up-bar ({macro_trend}). Buying CE.")
             return self._trigger_entry(
                 symbol, last_close, "CE",
                 config["trending_target_mult"], config["trending_sl_mult"],
                 entry_reason="VOLUME_BREAKOUT",
             )
-        if macro_trend == "BEARISH" and last_close < prev_close:
-            logging.info(f"[{symbol}] VOLUME_BREAKOUT down-bar in bearish regime. Buying PE.")
+        if (macro_trend == "BEARISH" or (macro_trend == "CHOPPY" and allow_chop)) and down_bar:
+            logging.info(f"[{symbol}] VOLUME_BREAKOUT down-bar ({macro_trend}). Buying PE.")
             return self._trigger_entry(
                 symbol, last_close, "PE",
                 config["trending_target_mult"], config["trending_sl_mult"],
@@ -348,24 +372,13 @@ class StrategyBrain:
 
         # Regime uses closed bars only so the forming candle cannot flicker entries
         closed = history[:-1]
-        ema_9 = self._calculate_ema(closed, 9)
-        ema_21 = self._calculate_ema(closed, 21)
-        session_mean = sum(closed) / len(closed)
         current_rsi = self._calculate_rsi(closed)
         last_rsi = self.last_closed_rsi.get(symbol, 50.0)
 
         config = INDICES_CONFIG[symbol]
-        vwap_buffer = config.get("vwap_buffer", 10.0)
-        ema_spread_min = config.get("ema_spread_min", 8.0)
         last_close = closed[-1]
         prev_close = closed[-2] if len(closed) >= 2 else last_close
-
-        if ema_9 > (ema_21 + ema_spread_min) and last_close > (session_mean + vwap_buffer):
-            macro_trend = "BULLISH"
-        elif ema_9 < (ema_21 - ema_spread_min) and last_close < (session_mean - vwap_buffer):
-            macro_trend = "BEARISH"
-        else:
-            macro_trend = "CHOPPY"
+        macro_trend, ema_9, ema_21, loc_mean = self._classify_regime(closed, config)
         self.current_regimes[symbol] = macro_trend
 
         if closed_bar:
@@ -388,6 +401,10 @@ class StrategyBrain:
         if not closed_bar:
             return
 
+        logging.info(
+            f"[{symbol}] Closed bar {macro_trend} px={last_close:.2f} "
+            f"ema9={ema_9:.1f} ema21={ema_21:.1f} mean20={loc_mean:.1f} rsi={current_rsi:.1f}"
+        )
         fired = self._try_volume_breakout(symbol, last_close, prev_close, macro_trend, config)
 
         recent_rsis = self.closed_rsi.get(symbol, [])

@@ -161,6 +161,7 @@ class TestAlgoEngineCore(unittest.TestCase):
     def test_volume_config_flags_present(self):
         self.assertTrue(RISK["require_volume_expansion"])
         self.assertTrue(RISK["enable_volume_breakout"])
+        self.assertTrue(RISK["enable_volume_breakout_in_chop"])
         self.assertEqual(RISK["volume_sma_bars"], 20)
         self.assertEqual(RISK["volume_mult"], 1.2)
         self.assertEqual(RISK["volume_hook_mult"], 1.0)
@@ -235,10 +236,15 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertEqual(len(om.calls), 1)
 
         gate.breakout_event["NIFTY"] = time_mod.time()
-        skipped = brain._try_volume_breakout("NIFTY", 101.0, 100.0, "CHOPPY", cfg)
+        skipped = brain._try_volume_breakout("NIFTY", 100.0, 100.0, "CHOPPY", cfg)
         self.assertFalse(skipped)
         self.assertEqual(len(om.calls), 1)
-        self.assertIsNone(gate.breakout_event["NIFTY"])
+
+        gate.breakout_event["NIFTY"] = time_mod.time()
+        chop_up = brain._try_volume_breakout("NIFTY", 101.0, 100.0, "CHOPPY", cfg)
+        self.assertTrue(chop_up)
+        self.assertEqual(om.calls[-1]["entry_reason"], "VOLUME_BREAKOUT")
+        self.assertEqual(len(om.calls), 2)
 
     def test_scorecard_by_entry_reason(self):
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -256,6 +262,27 @@ class TestAlgoEngineCore(unittest.TestCase):
             self.assertEqual(stats["by_entry"]["VOLUME_BREAKOUT"]["n"], 1)
         finally:
             os.remove(path)
+
+    def test_regime_uses_rolling_mean_not_full_session(self):
+        brain = StrategyBrain(order_engine=None, options_builders={}, db_manager=None)
+        cfg = INDICES_CONFIG["NIFTY"]
+        # Long flat session then a lift: old full-session mean would stay CHOPPY.
+        flat = [24250.0] * 80
+        lift = [24250.0 + i * 1.5 for i in range(1, 25)]
+        closed = flat + lift
+        trend, ema9, ema21, loc = brain._classify_regime(closed, cfg)
+        self.assertEqual(trend, "BULLISH")
+        self.assertGreater(ema9, ema21)
+        self.assertGreater(closed[-1], loc)
+
+        drop = [24280.0 - i * 1.5 for i in range(1, 25)]
+        closed_dn = [24280.0] * 80 + drop
+        trend_dn, _, _, _ = brain._classify_regime(closed_dn, cfg)
+        self.assertEqual(trend_dn, "BEARISH")
+
+        chop = [24250.0 + (8 if i % 2 == 0 else -8) for i in range(40)]
+        trend_ch, _, _, _ = brain._classify_regime(chop, cfg)
+        self.assertEqual(trend_ch, "CHOPPY")
 
 
 if __name__ == "__main__":
