@@ -75,7 +75,20 @@ class SystemHeartbeatMonitor(threading.Thread):
                     except Exception:
                         regime = "INITIALIZING"
 
-                    status_summary.append(f"[{index}] Spot: {spot_str} | Regime: {regime} | Trades Today: {trades}")
+                    vol_bit = ""
+                    try:
+                        snap = self.strategy_brain.volume_gate.snapshot(index)
+                        rv = snap.get("rvol")
+                        rv_s = f"{rv:.2f}x" if rv is not None else "n/a"
+                        vol_bit = (
+                            f" | Vol: {snap['bars']}/{snap['need']} {rv_s} "
+                            f"{'OK' if snap['ok'] else snap['reason']}"
+                        )
+                    except Exception:
+                        vol_bit = ""
+                    status_summary.append(
+                        f"[{index}] Spot: {spot_str} | Regime: {regime}{vol_bit} | Trades Today: {trades}"
+                    )
 
                 from scorecard import heartbeat_line
                 logging.info("💓 [SYSTEM STATUS] " + " || ".join(status_summary) + " || " + heartbeat_line(self.db_manager))
@@ -346,8 +359,30 @@ def main():
                     token = raw_token.replace('\x00', '').strip()
 
                     ltp_raw = message.get('last_traded_price') or message.get('ltp')
-                    vol_today = message.get("volume_trade_for_the_day") or message.get("vol_traded_today")
-                    last_qty = message.get("last_traded_quantity") or message.get("last_trade_qty")
+                    def _first_present(msg, keys):
+                        for key in keys:
+                            if msg.get(key) is not None:
+                                return msg.get(key)
+                        return None
+
+                    vol_today = _first_present(
+                        message,
+                        (
+                            "volume_trade_for_the_day",
+                            "vol_traded_today",
+                            "volumeTradeForTheDay",
+                            "volume",
+                        ),
+                    )
+                    last_qty = _first_present(
+                        message,
+                        (
+                            "last_traded_quantity",
+                            "last_trade_qty",
+                            "lastTradedQty",
+                            "ltq",
+                        ),
+                    )
 
                     if token in fut_token_to_index:
                         idx = fut_token_to_index[token]

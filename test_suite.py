@@ -92,6 +92,8 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertFalse(volume_expanded([100] * 20, 1.5, 20))
         self.assertTrue(volume_expanded([100] * 19 + [151], 1.5, 20))
         self.assertFalse(volume_expanded([100] * 19 + [149], 1.5, 20))
+        self.assertTrue(volume_expanded([100] * 19 + [120], 1.2, 20))
+        self.assertFalse(volume_expanded([100] * 19 + [119], 1.2, 20))
 
     def test_volume_gate_fail_closed_until_subscribe_and_bars(self):
         gate = VolumeExpansionGate()
@@ -99,8 +101,13 @@ class TestAlgoEngineCore(unittest.TestCase):
         gate.mark_subscribed("NIFTY", True)
         self.assertFalse(gate.allows_entry("NIFTY"))
         gate.closed_volumes["NIFTY"] = [100] * 19 + [200]
-        gate.volume_ok["NIFTY"] = volume_expanded(gate.closed_volumes["NIFTY"], 1.5, 20)
         self.assertTrue(gate.allows_entry("NIFTY"))
+        # Average volume is enough for RSI hook; 1.2x is only required for breakout.
+        gate.closed_volumes["NIFTY"] = [100] * 20
+        self.assertTrue(gate.allows_entry("NIFTY"))
+        self.assertFalse(volume_expanded(gate.closed_volumes["NIFTY"], RISK["volume_mult"], 20))
+        gate.closed_volumes["NIFTY"] = [100] * 19 + [50]
+        self.assertFalse(gate.allows_entry("NIFTY"))
 
     def test_scorecard_pnl_uses_stored_qty(self):
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -154,8 +161,33 @@ class TestAlgoEngineCore(unittest.TestCase):
     def test_volume_config_flags_present(self):
         self.assertTrue(RISK["require_volume_expansion"])
         self.assertTrue(RISK["enable_volume_breakout"])
+        self.assertTrue(RISK["enable_volume_breakout_in_chop"])
         self.assertEqual(RISK["volume_sma_bars"], 20)
-        self.assertEqual(RISK["volume_mult"], 1.5)
+        self.assertEqual(RISK["volume_mult"], 1.2)
+        self.assertEqual(RISK["volume_hook_mult"], 1.0)
+        self.assertGreaterEqual(RISK["volume_ok_hold_sec"], 60)
+
+    def test_volume_gate_ltq_fallback_and_sticky_hold(self):
+        import time as time_mod
+
+        gate = VolumeExpansionGate()
+        gate.mark_subscribed("NIFTY", True)
+        now = time_mod.time()
+        gate.last_bar_time["NIFTY"] = now
+        gate.last_bar_minute["NIFTY"] = int(now // 60)
+        gate.last_session_vol["NIFTY"] = 1000.0
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0)
+        self.assertEqual(gate.forming_vol["NIFTY"], 12.0)
+
+        gate.forming_vol["NIFTY"] = 80.0
+        gate.last_bar_time["NIFTY"] = now - 61
+        gate.last_bar_minute["NIFTY"] = int(now // 60) - 1
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=4.0)
+        self.assertEqual(gate.closed_volumes["NIFTY"][-1], 80.0)
+
+        gate.volume_ok_until["NIFTY"] = time_mod.time() + 60
+        gate.closed_volumes["NIFTY"] = [100] * 19 + [50]
+        self.assertTrue(gate.allows_entry("NIFTY"))
 
     def test_volume_breakout_consume_once_and_skip_choppy(self):
         import time as time_mod
@@ -204,10 +236,15 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertEqual(len(om.calls), 1)
 
         gate.breakout_event["NIFTY"] = time_mod.time()
-        skipped = brain._try_volume_breakout("NIFTY", 101.0, 100.0, "CHOPPY", cfg)
+        skipped = brain._try_volume_breakout("NIFTY", 100.0, 100.0, "CHOPPY", cfg)
         self.assertFalse(skipped)
         self.assertEqual(len(om.calls), 1)
-        self.assertIsNone(gate.breakout_event["NIFTY"])
+
+        gate.breakout_event["NIFTY"] = time_mod.time()
+        chop_up = brain._try_volume_breakout("NIFTY", 101.0, 100.0, "CHOPPY", cfg)
+        self.assertTrue(chop_up)
+        self.assertEqual(om.calls[-1]["entry_reason"], "VOLUME_BREAKOUT")
+        self.assertEqual(len(om.calls), 2)
 
     def test_scorecard_by_entry_reason(self):
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -225,6 +262,27 @@ class TestAlgoEngineCore(unittest.TestCase):
             self.assertEqual(stats["by_entry"]["VOLUME_BREAKOUT"]["n"], 1)
         finally:
             os.remove(path)
+
+    def test_regime_uses_rolling_mean_not_full_session(self):
+        brain = StrategyBrain(order_engine=None, options_builders={}, db_manager=None)
+        cfg = INDICES_CONFIG["NIFTY"]
+        # Long flat session then a lift: old full-session mean would stay CHOPPY.
+        flat = [24250.0] * 80
+        lift = [24250.0 + i * 1.5 for i in range(1, 25)]
+        closed = flat + lift
+        trend, ema9, ema21, loc = brain._classify_regime(closed, cfg)
+        self.assertEqual(trend, "BULLISH")
+        self.assertGreater(ema9, ema21)
+        self.assertGreater(closed[-1], loc)
+
+        drop = [24280.0 - i * 1.5 for i in range(1, 25)]
+        closed_dn = [24280.0] * 80 + drop
+        trend_dn, _, _, _ = brain._classify_regime(closed_dn, cfg)
+        self.assertEqual(trend_dn, "BEARISH")
+
+        chop = [24250.0 + (8 if i % 2 == 0 else -8) for i in range(40)]
+        trend_ch, _, _, _ = brain._classify_regime(chop, cfg)
+        self.assertEqual(trend_ch, "CHOPPY")
 
 
 if __name__ == "__main__":
