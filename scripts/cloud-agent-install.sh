@@ -10,7 +10,12 @@ fi
 rm -rf /tmp/_venv_probe
 
 rm -rf venv
-python3 -m venv venv
+python3 -m venv --copies venv
+
+if [[ ! -x venv/bin/python ]]; then
+  rm -rf venv
+  python3 -m venv --copies venv
+fi
 
 ./venv/bin/pip install --upgrade pip
 ./venv/bin/pip install -r requirements.txt
