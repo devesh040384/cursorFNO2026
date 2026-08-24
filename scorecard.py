@@ -2,6 +2,7 @@
 import argparse
 from collections import defaultdict
 from datetime import datetime, timedelta
+from ist_time import ist_naive
 
 from database import DatabaseManager
 from config import FALLBACK_LOT_SIZE, SCORECARD_SINCE
@@ -114,7 +115,7 @@ def load_trades(db_manager):
 
 
 def split_periods(all_rows, now=None, since=None):
-    now = now or datetime.now()
+    now = now or ist_naive()
     since = since or SCORECARD_SINCE
     today = now.strftime("%Y-%m-%d")
     week_start = (now - timedelta(days=7)).strftime("%Y-%m-%d")

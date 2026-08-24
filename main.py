@@ -12,7 +12,7 @@ import websocket
 from SmartApi import SmartConnect
 import pyotp
 
-from config import ACTIVE_INDICES, INDICES_CONFIG, PAPER_TRADING, RISK
+from config import ACTIVE_INDICES, INDICES_CONFIG, PAPER_TRADING, RISK, index_daily_entry_cap
 from database import DatabaseManager
 from options_chain_builder import DynamicOptionsChainBuilder
 from order_execution import OrderExecutionEngine
@@ -20,6 +20,7 @@ from strategy_brain import StrategyBrain
 from risk_monitors import TrailingStopLossMonitor, TradeReconciler
 from rate_limiter import RateLimitedAPI
 from history_seeder import seed_all
+from ist_time import ist_hhmm, ist_today
 
 # Disable raw binary frame tracing to prevent terminal flooding
 websocket.enableTrace(False)
@@ -60,11 +61,15 @@ class SystemHeartbeatMonitor(threading.Thread):
                 time.sleep(1)
                 
             try:
-                today_str = datetime.now().strftime("%Y-%m-%d")
+                activity = {}
+                try:
+                    activity = self.db_manager.index_activity_today()
+                except Exception:
+                    activity = {}
                 status_summary = []
 
                 for index in ACTIVE_INDICES:
-                    trades = self.get_trade_count_today(index, today_str)
+                    act = activity.get(index, {"entries": 0, "open": 0, "closed": 0, "pnl": 0.0})
                     spot = latest_market_state[index].get("spot_price")
                     spot_str = f"₹{spot:.2f}" if spot else "Waiting/Offline..."
                     
@@ -88,7 +93,10 @@ class SystemHeartbeatMonitor(threading.Thread):
                     except Exception:
                         vol_bit = ""
                     status_summary.append(
-                        f"[{index}] Spot: {spot_str} | Regime: {regime}{vol_bit} | Trades Today: {trades}"
+                        f"[{index}] Spot: {spot_str} | Regime: {regime}{vol_bit} | "
+                        f"Entries: {act['entries']}/{index_daily_entry_cap()} "
+                        f"(open {act['open']}, closed {act['closed']}, "
+                        f"PnL ₹{act['pnl']:.0f})"
                     )
 
                 from scorecard import heartbeat_line
@@ -96,11 +104,10 @@ class SystemHeartbeatMonitor(threading.Thread):
             except Exception as e:
                 logging.error(f"❌ Error in Heartbeat Monitor: {e}")
 
-    def get_trade_count_today(self, index_symbol, date_str):
+    def get_trade_count_today(self, index_symbol, date_str=None):
+        """Entries for one index today (IST). date_str kept for callers/tests."""
         try:
-            query = "SELECT COUNT(*) FROM trades WHERE symbol LIKE ? AND DATE(timestamp) = ?"
-            result = self.db_manager.fetch_one(query, (f"%{index_symbol}%", date_str))
-            return result[0] if result else 0
+            return self.db_manager.count_entries_today(index_name=index_symbol)
         except Exception:
             return 0
 
@@ -130,8 +137,7 @@ class EndOfDaySquareOffMonitor(threading.Thread):
                 time.sleep(1)
 
             try:
-                now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-                current_hour_min = now_ist.hour * 100 + now_ist.minute
+                current_hour_min = ist_hhmm()
 
                 if current_hour_min < 900:
                     self.has_squared_off_today = False
@@ -424,11 +430,22 @@ def main():
                         )
                     
                     if ltp_raw is not None:
-                        spot_price = float(ltp_raw) / 100.0 if float(ltp_raw) > 1000000 else float(ltp_raw)
+                        # SmartWebSocketV2 sends LTP in paise. The old
+                        # "divide only if > 1000000" heuristic silently fed a
+                        # 100x price to the strategy for any index under 10,000.
+                        spot_price = float(ltp_raw) / 100.0
                         current_time = time.time()
                         
                         for sym, cfg in INDICES_CONFIG.items():
                             if str(cfg["index_token"]) == token:
+                                lo = float(cfg.get("spot_min", 0.0))
+                                hi = float(cfg.get("spot_max", 0.0))
+                                if hi > 0 and not (lo <= spot_price <= hi):
+                                    logging.error(
+                                        f"[{sym}] Implausible spot ₹{spot_price:.2f} "
+                                        f"(raw {ltp_raw}); expected {lo:.0f}-{hi:.0f}. Tick dropped."
+                                    )
+                                    continue
                                 latest_market_state[sym]["spot_price"] = spot_price
                                 latest_market_state[sym]["last_tick_time"] = current_time
 

@@ -20,6 +20,10 @@ RISK = {
     "paper_max_daily_entries": 12,
     # Soft cap on TREND_CONT/RSI_HOOK so VOLUME_BREAKOUT still has room under the daily budget.
     "max_trend_entries_per_day": 4,
+    # Per-index daily entry cap. max_open_per_index is only a CONCURRENT cap, so
+    # one index could previously churn the entire daily budget by itself.
+    "max_daily_entries_per_index": 3,
+    "paper_max_daily_entries_per_index": 6,
     "session_start_hhmm": 945,
     "entry_cutoff_hhmm": 1430,
     "eod_squareoff_hhmm": 1515,
@@ -55,6 +59,14 @@ def daily_entry_cap():
     return int(RISK["max_daily_entries"])
 
 
+def index_daily_entry_cap():
+    """Per-index daily entry budget (paper gets the looser one)."""
+    if PAPER_TRADING:
+        return int(RISK.get("paper_max_daily_entries_per_index",
+                            RISK.get("max_daily_entries_per_index", 3)))
+    return int(RISK.get("max_daily_entries_per_index", 3))
+
+
 def signal_bar_sec():
     return max(60, int(RISK.get("signal_bar_sec", 300)))
 
@@ -87,6 +99,10 @@ INDICES_CONFIG = {
         "option_exchange": "NFO",
         "fut_exchange_type": 2,
         "symbol": "NIFTY",
+        # Sanity band for decoded websocket LTP (paise -> rupees). Out-of-band
+        # ticks are dropped instead of being fed to the strategy.
+        "spot_min": 5000.0,
+        "spot_max": 100000.0,
         "vwap_buffer": 2.0,
         "ema_spread_min": 1.0,
         "regime_mean_bars": 20,
@@ -103,6 +119,8 @@ INDICES_CONFIG = {
         "option_exchange": "BFO",
         "fut_exchange_type": 4,
         "symbol": "SENSEX",
+        "spot_min": 20000.0,
+        "spot_max": 300000.0,
         "vwap_buffer": 8.0,
         "ema_spread_min": 6.0,
         "regime_mean_bars": 20,

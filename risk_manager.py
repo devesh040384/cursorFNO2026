@@ -1,5 +1,5 @@
 import logging
-from config import FALLBACK_LOT_SIZE, RISK, daily_entry_cap
+from config import FALLBACK_LOT_SIZE, RISK, daily_entry_cap, index_daily_entry_cap
 
 
 class RiskManager:
@@ -95,6 +95,16 @@ class RiskManager:
                 f"({self.db.count_entries_today()}/{daily_entry_cap()})."
             )
             return False
+
+        if index_name:
+            idx_n = self.db.count_entries_today(index_name=index_name)
+            idx_cap = index_daily_entry_cap()
+            if idx_n >= idx_cap:
+                logging.info(
+                    f"RiskManager blocked entry: {index_name} per-index daily cap "
+                    f"reached ({idx_n}/{idx_cap})."
+                )
+                return False
 
         reason = str(order_proposal.get("entry_reason") or "").upper()
         trend_reasons = ("TREND_CONT", "RSI_HOOK")

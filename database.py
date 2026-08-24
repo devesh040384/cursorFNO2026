@@ -1,7 +1,7 @@
 import sqlite3
 import logging
 from contextlib import contextmanager
-from datetime import datetime
+from ist_time import ist_stamp, ist_today
 
 SCHEMA_COLUMNS = {
     "qty": "INTEGER",
@@ -94,7 +94,7 @@ class DatabaseManager:
     ):
         """Logs a new entry. Returns trade id or None."""
         try:
-            now_ist = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_ist = ist_stamp()
             with self.get_cursor() as cursor:
                 cursor.execute(
                     """
@@ -135,7 +135,7 @@ class DatabaseManager:
 
     def close_trade(self, trade_id, exit_price, exit_reason):
         try:
-            now_ist = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_ist = ist_stamp()
             with self.get_cursor() as cursor:
                 cursor.execute(
                     """
@@ -170,33 +170,74 @@ class DatabaseManager:
         except Exception:
             return 0
 
-    def count_entries_today(self, entry_reasons=None):
-        today = datetime.now().strftime("%Y-%m-%d")
+    def count_entries_today(self, entry_reasons=None, index_name=None):
+        """Entries opened today (IST). Optionally filtered by reason and/or index."""
+        today = ist_today()
+        where = ["COALESCE(entry_time, timestamp, '') LIKE ?"]
+        params = [f"{today}%"]
         if entry_reasons:
-            reasons = tuple(entry_reasons)
-            placeholders = ",".join("?" for _ in reasons)
-            row = self.fetch_one(
-                f"""
-                SELECT COUNT(*) AS n FROM trades
-                WHERE COALESCE(entry_time, timestamp, '') LIKE ?
-                  AND UPPER(COALESCE(entry_reason, '')) IN ({placeholders})
-                """,
-                (f"{today}%",) + tuple(r.upper() for r in reasons),
+            reasons = tuple(r.upper() for r in entry_reasons)
+            where.append(
+                f"UPPER(COALESCE(entry_reason, '')) IN ({','.join('?' for _ in reasons)})"
             )
-        else:
-            row = self.fetch_one(
-                """
-                SELECT COUNT(*) AS n FROM trades
-                WHERE COALESCE(entry_time, timestamp, '') LIKE ?
-                """,
-                (f"{today}%",),
-            )
+            params.extend(reasons)
+        if index_name:
+            # index_name was added by migration, so older rows fall back to the symbol.
+            where.append("(index_name = ? OR (index_name IS NULL AND UPPER(symbol) LIKE ?))")
+            params.extend([index_name, f"{index_name.upper()}%"])
+        row = self.fetch_one(
+            f"SELECT COUNT(*) AS n FROM trades WHERE {' AND '.join(where)}",
+            tuple(params),
+        )
         if row is None:
             return 0
         return int(row[0])
 
+    def entry_counts_by_index_today(self):
+        """{index_name: entries_today} in IST — drives the per-index daily cap."""
+        rows = self.fetch_all(
+            """
+            SELECT COALESCE(index_name, UPPER(symbol)) AS idx, COUNT(*) AS n
+            FROM trades
+            WHERE COALESCE(entry_time, timestamp, '') LIKE ?
+            GROUP BY idx
+            """,
+            (f"{ist_today()}%",),
+        )
+        return {str(r[0]): int(r[1]) for r in rows if r and r[0]}
+
+    def index_activity_today(self):
+        """Per-index entries / open / closed / realised PnL for the daily report."""
+        rows = self.fetch_all(
+            """
+            SELECT COALESCE(index_name, UPPER(symbol)) AS idx,
+                   COUNT(*) AS entries,
+                   SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_n,
+                   SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_n,
+                   SUM(CASE WHEN status = 'CLOSED' AND exit_price IS NOT NULL
+                                 AND entry_price IS NOT NULL
+                            THEN (exit_price - entry_price) * COALESCE(qty, 0)
+                            ELSE 0 END) AS pnl
+            FROM trades
+            WHERE COALESCE(entry_time, timestamp, '') LIKE ?
+            GROUP BY idx
+            """,
+            (f"{ist_today()}%",),
+        )
+        out = {}
+        for r in rows:
+            if not r or not r[0]:
+                continue
+            out[str(r[0])] = {
+                "entries": int(r[1] or 0),
+                "open": int(r[2] or 0),
+                "closed": int(r[3] or 0),
+                "pnl": float(r[4] or 0.0),
+            }
+        return out
+
     def fetch_closed_today(self):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = ist_today()
         return self.fetch_all(
             """
             SELECT symbol, qty, entry_price, exit_price, COALESCE(entry_time, timestamp) AS t

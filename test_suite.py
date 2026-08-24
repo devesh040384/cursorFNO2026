@@ -576,5 +576,112 @@ class HistorySeedTests(unittest.TestCase):
         self.assertFalse(gate.partial_first_bar["NIFTY"])
 
 
+class PerIndexCapTests(unittest.TestCase):
+    def _db(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        return DatabaseManager(path), path
+
+    def test_per_index_daily_cap_blocks_one_index_only(self):
+        from config import index_daily_entry_cap
+
+        db, path = self._db()
+        try:
+            cap = index_daily_entry_cap()
+            for i in range(cap):
+                tid = db.log_trade(f"NIFTY26AUG245{i}0CE", "1", 100.0, 122.0, 90.0,
+                                   qty=65, exchange="NFO", index_name="NIFTY",
+                                   entry_reason="VOLUME_BREAKOUT")
+                # Close them flat so open-trade caps and the loss breaker stay clear
+                # and only the per-index daily cap is under test.
+                db.close_trade(tid, 100.0, "TARGET_HIT")
+            self.assertEqual(db.count_entries_today(index_name="NIFTY"), cap)
+            self.assertEqual(db.count_entries_today(index_name="SENSEX"), 0)
+
+            rm = RiskManager(db_manager=db)
+            # NIFTY is at its per-index cap...
+            self.assertFalse(rm.assess_order_safety(
+                {"qty": 65, "index_name": "NIFTY", "symbol": "X", "entry_reason": "VOLUME_BREAKOUT"},
+                estimated_premium=100.0,
+            ))
+            # ...but SENSEX still has its own budget.
+            self.assertTrue(rm.assess_order_safety(
+                {"qty": 20, "index_name": "SENSEX", "symbol": "Y", "entry_reason": "VOLUME_BREAKOUT"},
+                estimated_premium=100.0,
+            ))
+        finally:
+            os.remove(path)
+
+    def test_index_activity_today_reports_per_index(self):
+        db, path = self._db()
+        try:
+            tid = db.log_trade("NIFTY26AUG24500CE", "1", 100.0, 122.0, 90.0,
+                               qty=65, exchange="NFO", index_name="NIFTY")
+            db.close_trade(tid, 110.0, "TARGET_HIT")
+            db.log_trade("SENSEX26AUG81000PE", "2", 200.0, 244.0, 180.0,
+                         qty=20, exchange="BFO", index_name="SENSEX")
+            act = db.index_activity_today()
+            self.assertEqual(act["NIFTY"]["entries"], 1)
+            self.assertEqual(act["NIFTY"]["closed"], 1)
+            self.assertAlmostEqual(act["NIFTY"]["pnl"], 10.0 * 65)
+            self.assertEqual(act["SENSEX"]["open"], 1)
+            self.assertAlmostEqual(act["SENSEX"]["pnl"], 0.0)
+        finally:
+            os.remove(path)
+
+
+class FeedGapTests(unittest.TestCase):
+    def test_volume_gap_drops_partial_bar_and_sticky_state(self):
+        gate = VolumeExpansionGate()
+        gate.mark_subscribed("NIFTY", True)
+        gate.closed_volumes["NIFTY"] = [100.0] * 8
+        gate.last_bar_time["NIFTY"] = time.time() - 1800  # 6 bars of silence
+        gate.last_bar_bucket["NIFTY"] = -1
+        gate.volume_ok_until["NIFTY"] = time.time() + 600
+        gate.breakout_event["NIFTY"] = time.time()
+
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0)
+        # No phantom/partial bar appended.
+        self.assertEqual(len(gate.closed_volumes["NIFTY"]), 8)
+        # Sticky expansion from before the gap must not survive it.
+        self.assertFalse(gate.has_fresh_breakout("NIFTY"))
+        self.assertEqual(gate.volume_ok_until["NIFTY"], 0.0)
+
+    def test_price_gap_pauses_entries(self):
+        brain = StrategyBrain(order_engine=None, options_builders={})
+        brain.price_histories["NIFTY"] = [24000.0 + i for i in range(30)]
+        brain.last_candle_times["NIFTY"] = time.time() - 1800  # 6 bars missed
+        brain.last_signal_buckets["NIFTY"] = -1
+        brain.evaluate_tick("NIFTY", 24100.0)
+        self.assertGreater(brain.stale_bars["NIFTY"], 0)
+
+
+class ISTTimeTests(unittest.TestCase):
+    def test_ist_helpers_are_offset_from_utc(self):
+        from datetime import datetime, timezone
+        from ist_time import ist_now, ist_today, ist_hhmm
+
+        utc = datetime.now(timezone.utc)
+        delta = (ist_now().replace(tzinfo=None) - utc.replace(tzinfo=None)).total_seconds()
+        self.assertAlmostEqual(delta, 5.5 * 3600, delta=5)
+        self.assertEqual(len(ist_today()), 10)
+        self.assertTrue(0 <= ist_hhmm() <= 2359)
+
+    def test_db_stamps_trades_in_ist(self):
+        from ist_time import ist_today
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            db = DatabaseManager(path)
+            db.log_trade("NIFTY26AUG24500CE", "1", 100.0, 122.0, 90.0,
+                         qty=65, exchange="NFO", index_name="NIFTY")
+            row = db.fetch_one("SELECT entry_time FROM trades")
+            self.assertTrue(str(row[0]).startswith(ist_today()))
+            self.assertEqual(db.count_entries_today(), 1)
+        finally:
+            os.remove(path)
+
+
 if __name__ == "__main__":
     unittest.main()

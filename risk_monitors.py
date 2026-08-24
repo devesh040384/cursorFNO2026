@@ -2,6 +2,7 @@ import logging
 import time
 import threading
 from datetime import datetime
+from ist_time import ist_naive
 from config import FALLBACK_LOT_SIZE, PAPER_TRADING, RISK
 
 
@@ -120,7 +121,8 @@ class TrailingStopLossMonitor(threading.Thread):
             entered = datetime.strptime(entry_ts[:19], "%Y-%m-%d %H:%M:%S")
         except ValueError:
             return False
-        age = (datetime.now() - entered).total_seconds() / 60.0
+        # entry_ts is stored as IST wall-clock, so compare against IST.
+        age = (ist_naive() - entered).total_seconds() / 60.0
         return age >= minutes and current_price < entry_price * min_gain
 
     def close_trade(self, trade_id, symbol, token, qty, exchange, exit_price, reason):

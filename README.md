@@ -45,6 +45,7 @@ python3 -m unittest test_suite.py -v
 | `database.py` | SQLite `trade_history.db` (WAL) |
 | `scorecard.py` | PnL / win-rate from stored qty |
 | `history_seeder.py` | Seeds 5-min bar history from broker candles at startup |
+| `ist_time.py` | Single source of IST wall-clock (all dates/stamps) |
 | `config.py` | All live knobs |
 
 **Startup seeding**
@@ -112,7 +113,8 @@ After a fill: **15-min** per-index cooldown.
 
 | Knob | Paper | Live (default) |
 |------|-------|----------------|
-| Daily entries | **12** | **4** |
+| Daily entries (total) | **12** | **4** |
+| Daily entries **per index** | **6** | **3** |
 | Trend soft-cap (`TREND_CONT` + `RSI_HOOK`) | **4**/day | **4**/day |
 | Max open / index | 1 | 1 |
 | Max open total | 2 | 2 |
@@ -125,6 +127,25 @@ After a fill: **15-min** per-index cooldown.
 | Max notional | ₹8000 | ₹8000 |
 
 `VOLUME_BREAKOUT` is not limited by the trend soft-cap (only by the daily entry budget).
+
+### Circuit breaker (hard halt)
+
+`RiskManager.refresh_from_db()` runs before **every** entry and recomputes the day
+from closed trades. It latches `trading_halted = True` — no further entries for the
+rest of the process — when either fires:
+
+| Trip | Threshold |
+|------|-----------|
+| Realised daily loss | ≤ **−₹1500** (`max_daily_loss_inr`) |
+| Consecutive losing trades | **3** in a row (`max_consecutive_losses`) |
+
+It logs `CIRCUIT BREAKER: PnL ... | streak ...` at CRITICAL. It halts **entries only** —
+open positions keep their trailing SL, time-stop and 15:15 square-off. It is *realised*
+PnL: an open losing position does not trip it. Restarting the process clears the latch,
+but `refresh_from_db()` re-trips it immediately from the same day's closed rows.
+
+Separate, non-latching gates that also block entries: total daily cap, per-index daily
+cap, trend soft-cap, max open per index / total, premium floor, notional ceiling.
 
 ### Exits
 
@@ -148,6 +169,8 @@ trend_cont_requires_expansion = True
 paper_max_daily_entries   = 12
 max_daily_entries         = 4
 max_trend_entries_per_day = 4
+max_daily_entries_per_index       = 3    # live
+paper_max_daily_entries_per_index = 6
 PAPER_TRADING             = True
 ACTIVE_INDICES            = NIFTY, SENSEX
 SCORECARD_SINCE           = 2026-08-21
