@@ -166,6 +166,14 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertEqual(RISK["volume_mult"], 1.2)
         self.assertEqual(RISK["volume_hook_mult"], 1.0)
         self.assertGreaterEqual(RISK["volume_ok_hold_sec"], 60)
+        self.assertTrue(RISK["trend_cont_requires_expansion"])
+        self.assertGreaterEqual(RISK["paper_max_daily_entries"], 12)
+        self.assertLessEqual(RISK["max_trend_entries_per_day"], RISK["paper_max_daily_entries"])
+        from config import PAPER_TRADING, daily_entry_cap
+        if PAPER_TRADING:
+            self.assertEqual(daily_entry_cap(), RISK["paper_max_daily_entries"])
+        else:
+            self.assertEqual(daily_entry_cap(), RISK["max_daily_entries"])
 
     def test_volume_gate_ltq_fallback_and_sticky_hold(self):
         import time as time_mod
@@ -350,13 +358,85 @@ class TestAlgoEngineCore(unittest.TestCase):
             db_manager=None,
         )
         brain.volume_gate.mark_subscribed("NIFTY", True)
+        # Flat average volume is enough for old hook gate, but TREND_CONT now needs expansion.
         brain.volume_gate.closed_volumes["NIFTY"] = [100] * 8
         cfg = INDICES_CONFIG["NIFTY"]
+        blocked = brain._try_trend_entries(
+            "NIFTY", 24265.0, 24262.0, "BULLISH", cfg, last_rsi=61.0, current_rsi=61.5
+        )
+        self.assertFalse(blocked)
+        self.assertEqual(len(om.calls), 0)
+
+        brain.volume_gate.closed_volumes["NIFTY"] = [100] * 7 + [120]
         fired = brain._try_trend_entries(
             "NIFTY", 24265.0, 24262.0, "BULLISH", cfg, last_rsi=61.0, current_rsi=61.5
         )
         self.assertTrue(fired)
         self.assertEqual(om.calls[0]["entry_reason"], "TREND_CONT")
+
+    def test_trend_soft_cap_still_allows_volume_breakout(self):
+        class FakeAPI:
+            def ltpData(self, *a, **k):
+                return {"status": True, "data": {"ltp": 100.0}}
+
+        class FakeOM:
+            def __init__(self):
+                self.calls = []
+                self.smart_api = FakeAPI()
+
+            def execute_entry(self, **kwargs):
+                self.calls.append(kwargs)
+                return "oid"
+
+        class FakeBuilder:
+            def get_nearest_expiry_contract(self, spot, instrument_type="CE"):
+                return {"symbol": "NIFTYCE", "token": "1", "lotsize": 65, "exchange": "NFO"}
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            db = DatabaseManager(path)
+            today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for i in range(RISK["max_trend_entries_per_day"]):
+                tid = db.log_trade(
+                    f"NIFTYCE{i}", str(i), 100.0, 122.0, 90.0,
+                    qty=65, exchange="NFO", index_name="NIFTY", entry_reason="TREND_CONT",
+                )
+                db.close_trade(tid, 100.0, "TIME_STOP")  # flat: avoid circuit-breaker halt
+            self.assertEqual(
+                db.count_entries_today(entry_reasons=("TREND_CONT", "RSI_HOOK")),
+                RISK["max_trend_entries_per_day"],
+            )
+
+            risk = RiskManager(db_manager=db)
+            blocked = risk.assess_order_safety(
+                {"qty": 65, "index_name": "NIFTY", "symbol": "X", "entry_reason": "TREND_CONT"},
+                estimated_premium=100.0,
+            )
+            self.assertFalse(blocked)
+
+            allowed = risk.assess_order_safety(
+                {"qty": 65, "index_name": "NIFTY", "symbol": "Y", "entry_reason": "VOLUME_BREAKOUT"},
+                estimated_premium=100.0,
+            )
+            self.assertTrue(allowed)
+
+            om = FakeOM()
+            brain = StrategyBrain(
+                order_engine=om,
+                options_builders={"26000": FakeBuilder()},
+                db_manager=db,
+                risk_manager=risk,
+            )
+            brain.volume_gate.mark_subscribed("NIFTY", True)
+            import time as time_mod
+            brain.volume_gate.breakout_event["NIFTY"] = time_mod.time()
+            cfg = INDICES_CONFIG["NIFTY"]
+            fired = brain._try_volume_breakout("NIFTY", 101.0, 100.0, "BULLISH", cfg)
+            self.assertTrue(fired)
+            self.assertEqual(om.calls[0]["entry_reason"], "VOLUME_BREAKOUT")
+        finally:
+            os.remove(path)
 
     def test_duplicate_fut_ticks_do_not_inflate_volume(self):
         gate = VolumeExpansionGate()
