@@ -4,6 +4,25 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-08-25 — Startup history seeding (09:45 ready)
+
+- New `history_seeder.py`: pulls closed **FIVE_MINUTE** candles from `getCandleData`
+  at startup and fills `price_histories` (index) + `closed_volumes` (futures RVOL).
+- Removes the ~110-min live warmup (22 x 5-min bars); the bot is signal-ready at
+  the **09:45** session start instead of ~11:35.
+- Seeder drops the in-progress candle, seeds `last_closed_rsi` + the 5-bar
+  `closed_rsi` ring (RSI_HOOK confirmation), and clears any breakout event so
+  historical bars cannot fire a stale entry.
+- Volume gate discards its **partial first live bar** (mid-bucket join) — it used
+  to dilute the RVOL SMA and fake an expansion on the next bar.
+- `rsi_state.json` date now stamped in **IST**, not host-local time; `closed_rsi`
+  is persisted/restored across restarts.
+
+**Why:** 09:45–11:35 was dead time every session; the two best NIFTY/SENSEX
+expansion windows sit inside it.
+
+---
+
 ## 2026-08-24 — PR #6 Hybrid 5-min signal bars
 
 **Branch:** `cursor/signal-5min-hybrid-c12f`
@@ -96,4 +115,5 @@ All notable bot / strategy changes. Format: newest first.
 | Liquidity | Volume + real depth spread (no fake 2%) |
 | Risk | Loss/streak halt, open caps, paper 12 / live 4, trend soft-cap 4 |
 | Session | 09:45–14:30 entries; 15:15 EOD |
+| Warmup | Seeded from broker 5-min candles at startup |
 | Scorecard | From 2026-08-21 |

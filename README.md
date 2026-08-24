@@ -44,7 +44,20 @@ python3 -m unittest test_suite.py -v
 | `risk_monitors.py` | Trailing SL, target, time-stop (tick / ~5s loop) |
 | `database.py` | SQLite `trade_history.db` (WAL) |
 | `scorecard.py` | PnL / win-rate from stored qty |
+| `history_seeder.py` | Seeds 5-min bar history from broker candles at startup |
 | `config.py` | All live knobs |
+
+**Startup seeding**
+
+Building 22 x 5-min bars from live ticks takes ~110 minutes, so entries could not
+start until ~11:35. On boot the bot now fetches closed `FIVE_MINUTE` candles
+(`getCandleData`) for each index and its nearest future, filling regime/RSI history
+and the futures RVOL window. The in-progress candle is dropped and no breakout
+event is carried over. Entries are then gated only by `session_start_hhmm`
+(**09:45**), which skips the opening-auction noise.
+
+If the candle API fails or returns too few bars, the bot logs a warning and falls
+back to the old live warmup — it does not trade on partial history.
 
 **Hybrid timeframe**
 
@@ -146,7 +159,9 @@ SCORECARD_SINCE           = 2026-08-21
 
 - `.env` is **gitignored**. Recreate on each host; do not re-commit secrets.  
 - After upgrading from 1-min signals, old `rsi_state.json` is ignored (bar size mismatch).  
-- Futures must resolve at startup or the volume gate blocks entries.  
+- Futures must resolve at startup or the volume gate blocks entries.
+- Seeding needs historical-data permission on the SmartAPI key; BFO (SENSEX) candle
+  support is broker-dependent — check the `[seed]` lines in the log.  
 - Heartbeat logs spot, regime, volume warmup/`rvol`, and scorecard PnL.  
 
 Full change history: see **[CHANGELOG.md](CHANGELOG.md)**.
