@@ -1,4 +1,5 @@
 # config.py — live knobs. Keep PAPER_TRADING True until paper results are stable.
+from datetime import datetime, timedelta
 
 # Scorecard / eval: ignore trades before this date (bugfix + volume strategy deploy)
 SCORECARD_SINCE = "2026-08-21"
@@ -27,14 +28,18 @@ RISK = {
     "max_premium_risk_inr": 8000.0,
     "time_stop_minutes": 25,
     "time_stop_min_gain_mult": 1.02,
+    # Hybrid: 5-min closed bars for regime/entries/RVOL; exits stay tick/1-min monitors.
+    "signal_bar_sec": 300,
+    "breakout_max_age_sec": 600,
     "require_volume_expansion": True,
     "enable_volume_breakout": True,
     "enable_volume_breakout_in_chop": True,
     "volume_sma_bars": 8,
-    # 1-min futures: breakout uses volume_mult; RSI hook may use hook_mult
+    # 5-min futures: breakout uses volume_mult; RSI hook may use hook_mult
     "volume_mult": 1.2,
     "volume_hook_mult": 1.0,
-    "volume_ok_hold_sec": 180,
+    # Hold expansion ~2 signal bars so TREND_CONT can use a fresh breakout.
+    "volume_ok_hold_sec": 600,
     # Aug 24: TREND_CONT with only rvol>=1.0 fired into chop; require real expansion.
     "trend_cont_requires_expansion": True,
     "trend_cont_rsi_max": 68.0,
@@ -48,6 +53,24 @@ def daily_entry_cap():
     if PAPER_TRADING:
         return int(RISK.get("paper_max_daily_entries", RISK["max_daily_entries"]))
     return int(RISK["max_daily_entries"])
+
+
+def signal_bar_sec():
+    return max(60, int(RISK.get("signal_bar_sec", 300)))
+
+
+def signal_bar_bucket(now_ts=None):
+    """IST wall-clock bucket for signal bars (aligns to :00/:05/:10 ... when bar=300)."""
+    from datetime import timezone
+
+    bar = signal_bar_sec()
+    if now_ts is not None:
+        now_ist = datetime.fromtimestamp(now_ts, tz=timezone.utc) + timedelta(hours=5, minutes=30)
+    else:
+        now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    secs = now_ist.hour * 3600 + now_ist.minute * 60 + now_ist.second
+    return secs // bar
+
 
 # Fallback lot sizes if scrip master omits lotsize (must match current NSE/BSE lots)
 FALLBACK_LOT_SIZE = {

@@ -81,7 +81,7 @@ class SystemHeartbeatMonitor(threading.Thread):
                         rv = snap.get("rvol")
                         rv_s = f"{rv:.2f}x" if rv is not None else "n/a"
                         vol_bit = (
-                            f" | Vol: {snap['bars']}/{snap['need']} {rv_s} "
+                            f" | Vol({snap.get('bar_min', 5)}m): {snap['bars']}/{snap['need']} {rv_s} "
                             f"{'OK' if snap['ok'] else snap['reason']}"
                         )
                     except Exception:
