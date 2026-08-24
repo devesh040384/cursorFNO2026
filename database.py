@@ -170,15 +170,27 @@ class DatabaseManager:
         except Exception:
             return 0
 
-    def count_entries_today(self):
+    def count_entries_today(self, entry_reasons=None):
         today = datetime.now().strftime("%Y-%m-%d")
-        row = self.fetch_one(
-            """
-            SELECT COUNT(*) AS n FROM trades
-            WHERE COALESCE(entry_time, timestamp, '') LIKE ?
-            """,
-            (f"{today}%",),
-        )
+        if entry_reasons:
+            reasons = tuple(entry_reasons)
+            placeholders = ",".join("?" for _ in reasons)
+            row = self.fetch_one(
+                f"""
+                SELECT COUNT(*) AS n FROM trades
+                WHERE COALESCE(entry_time, timestamp, '') LIKE ?
+                  AND UPPER(COALESCE(entry_reason, '')) IN ({placeholders})
+                """,
+                (f"{today}%",) + tuple(r.upper() for r in reasons),
+            )
+        else:
+            row = self.fetch_one(
+                """
+                SELECT COUNT(*) AS n FROM trades
+                WHERE COALESCE(entry_time, timestamp, '') LIKE ?
+                """,
+                (f"{today}%",),
+            )
         if row is None:
             return 0
         return int(row[0])

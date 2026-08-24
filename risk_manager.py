@@ -1,5 +1,5 @@
 import logging
-from config import FALLBACK_LOT_SIZE, RISK
+from config import FALLBACK_LOT_SIZE, RISK, daily_entry_cap
 
 
 class RiskManager:
@@ -89,9 +89,24 @@ class RiskManager:
         if index_name and self.db.count_open_trades(index_name) >= RISK["max_open_per_index"]:
             logging.info(f"RiskManager blocked entry: {index_name} already has an OPEN trade.")
             return False
-        if self.db.count_entries_today() >= RISK["max_daily_entries"]:
-            logging.info("RiskManager blocked entry: daily entry cap reached.")
+        if self.db.count_entries_today() >= daily_entry_cap():
+            logging.info(
+                f"RiskManager blocked entry: daily entry cap reached "
+                f"({self.db.count_entries_today()}/{daily_entry_cap()})."
+            )
             return False
+
+        reason = str(order_proposal.get("entry_reason") or "").upper()
+        trend_reasons = ("TREND_CONT", "RSI_HOOK")
+        if reason in trend_reasons:
+            trend_cap = int(RISK.get("max_trend_entries_per_day", daily_entry_cap()))
+            trend_n = self.db.count_entries_today(entry_reasons=trend_reasons)
+            if trend_n >= trend_cap:
+                logging.info(
+                    f"RiskManager blocked {reason}: trend soft-cap "
+                    f"{trend_n}/{trend_cap} (VOLUME_BREAKOUT still allowed)."
+                )
+                return False
 
         qty = int(order_proposal.get("qty") or 0)
         premium = float(estimated_premium or 0.0)
