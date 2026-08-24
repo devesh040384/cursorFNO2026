@@ -2,11 +2,14 @@ import time
 import json
 import os
 import logging
-from datetime import datetime, timedelta
-from datetime import timezone
 from config import FALLBACK_LOT_SIZE, INDICES_CONFIG, RISK, signal_bar_bucket, signal_bar_sec
+from ist_time import ist_hhmm, ist_today
 from risk_manager import RiskManager
 from indicators import wilder_rsi, volume_expanded
+
+# Upper bound on the entry pause after a feed gap: EMA21 needs ~21 clean bars,
+# but pausing longer than that just wastes the session.
+MAX_STALE_BARS = 22
 
 
 class VolumeExpansionGate:
@@ -209,6 +212,23 @@ class VolumeExpansionGate:
         clock_rolled = last_bucket is not None and bucket != last_bucket
         elapsed_rolled = now - self.last_bar_time[symbol] >= bar_sec
         if clock_rolled or elapsed_rolled:
+            # A feed gap (reconnect) spans several buckets but only closes one bar,
+            # so the "bar" holds a fraction of the traded volume. Padding with zeros
+            # would crater the SMA and fake an expansion on the next bar, so drop the
+            # stale sticky state and let RVOL rebuild from clean bars instead.
+            missed = int((now - self.last_bar_time[symbol]) // bar_sec) - 1
+            if missed > 0:
+                logging.warning(
+                    f"[{symbol}] Futures volume feed gap: {missed} bar(s) missed. "
+                    "Dropping partial bar and clearing sticky expansion."
+                )
+                self.volume_ok[symbol] = False
+                self.volume_ok_until[symbol] = 0.0
+                self.breakout_event[symbol] = None
+                self.forming_vol[symbol] = increment
+                self.last_bar_time[symbol] = now
+                self.last_bar_bucket[symbol] = bucket
+                return
             self._close_volume_bar(symbol, now, increment)
             self.last_bar_bucket[symbol] = bucket
         else:
@@ -231,6 +251,9 @@ class StrategyBrain:
         self.cooldown_until = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
         self.last_closed_rsi = {symbol: 50.0 for symbol in INDICES_CONFIG.keys()}
         self.current_regimes = {symbol: "INITIALIZING" for symbol in INDICES_CONFIG.keys()}
+        # Set when a tick gap distorts the bar series; blocks entries until enough
+        # clean bars have been rebuilt (see _bar_gap_bars).
+        self.stale_bars = {symbol: 0 for symbol in INDICES_CONFIG.keys()}
         self.volume_gate = kwargs.get("volume_gate") or VolumeExpansionGate()
 
         self.state_file = "rsi_state.json"
@@ -248,14 +271,9 @@ class StrategyBrain:
             ema = (price - ema) * multiplier + ema
         return ema
 
-    @staticmethod
-    def _ist_today():
-        ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-        return ist.strftime("%Y-%m-%d")
-
     def _save_state(self):
         try:
-            today_str = self._ist_today()
+            today_str = ist_today()
             with open(self.state_file, "w") as f:
                 json.dump({
                     "date": today_str,
@@ -272,7 +290,7 @@ class StrategyBrain:
         if not os.path.exists(self.state_file):
             return
         try:
-            today_str = self._ist_today()
+            today_str = ist_today()
             with open(self.state_file, "r") as f:
                 state = json.load(f)
             if state.get("date", "") != today_str:
@@ -491,8 +509,7 @@ class StrategyBrain:
         if symbol not in INDICES_CONFIG:
             return
         current_time = time.time()
-        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        current_hour_min = now_ist.hour * 100 + now_ist.minute
+        current_hour_min = ist_hhmm()
         bar_sec = signal_bar_sec()
         bucket = signal_bar_bucket(current_time)
 
@@ -505,6 +522,17 @@ class StrategyBrain:
         bucket_rolled = last_bucket is not None and bucket != last_bucket
         elapsed_rolled = current_time - last_candle_time >= bar_sec
         if bucket_rolled or elapsed_rolled:
+            # Missed buckets mean the appended close is not one bar after the last
+            # one; EMA/RSI spacing is distorted until clean bars replace the gap.
+            missed = int((current_time - last_candle_time) // bar_sec) - 1
+            if missed > 0 and last_candle_time > 0.0:
+                self.stale_bars[symbol] = min(
+                    MAX_STALE_BARS, self.stale_bars.get(symbol, 0) + missed
+                )
+                logging.warning(
+                    f"[{symbol}] Signal bar gap: {missed} bar(s) missed. "
+                    f"Entries paused for {self.stale_bars[symbol]} clean bar(s)."
+                )
             if history:
                 closed_bar = True
             history.append(spot_price)
@@ -558,6 +586,16 @@ class StrategyBrain:
             return
 
         if not closed_bar:
+            return
+
+        if self.stale_bars.get(symbol, 0) > 0:
+            self.stale_bars[symbol] -= 1
+            logging.info(
+                f"[{symbol}] Entry paused: rebuilding after feed gap "
+                f"({self.stale_bars[symbol]} bar(s) left)."
+            )
+            self.last_closed_rsi[symbol] = current_rsi
+            self._save_state()
             return
 
         bar_m = max(1, bar_sec // 60)

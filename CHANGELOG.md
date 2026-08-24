@@ -4,6 +4,31 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-08-25 — IST correctness, per-index cap, feed-gap safety
+
+- **New `ist_time.py`** — every date/stamp now IST. `database.py`, `scorecard.py`,
+  `daily_summary.py`, `risk_monitors.py` and the heartbeat used host-local
+  `datetime.now()`; on a non-IST host that made `count_entries_today` /
+  `fetch_closed_today` query the wrong day, so the daily cap and the loss
+  circuit breaker both saw zero trades and never fired.
+- **Per-index daily entry cap** (`max_daily_entries_per_index` 3 live / 6 paper).
+  `max_open_per_index` was only a *concurrent* cap — one index could churn the
+  whole daily budget alone.
+- Heartbeat now reports **entries / cap, open, closed and realised PnL per index**.
+- **Feed-gap safety**: a reconnect spanning several bars used to close one partial
+  bar. Volume side now drops it and clears sticky expansion (a partial bar dragged
+  the SMA down and faked a breakout); price side pauses entries until clean bars
+  are rebuilt (`stale_bars`).
+- **LTP decode fixed**: `ltp/100 if ltp > 1000000` fed a 100x price to the strategy
+  for any index under 10,000. Websocket LTP is always paise — always divide, and
+  drop ticks outside a per-index `spot_min`/`spot_max` band.
+- `time_stop` age compared IST-stamped `entry_time` against local `now()`.
+- Removed dead `startup_sync.py` (duplicate `TradeReconciler`, filtered `NFO` only
+  so it missed every SENSEX/BFO position) and unused `historical_features.py`.
+- Dropped the deprecated `datetime.utcnow()` calls.
+
+---
+
 ## 2026-08-25 — Startup history seeding (09:45 ready)
 
 - New `history_seeder.py`: pulls closed **FIVE_MINUTE** candles from `getCandleData`
@@ -113,7 +138,7 @@ expansion windows sit inside it.
 | Choppy extreme RSI | OFF |
 | Volume gate | Futures RVOL, sticky hold, tick dedupe |
 | Liquidity | Volume + real depth spread (no fake 2%) |
-| Risk | Loss/streak halt, open caps, paper 12 / live 4, trend soft-cap 4 |
+| Risk | Loss/streak halt, open caps, paper 12 / live 4 daily, per-index 6/3, trend soft-cap 4 |
 | Session | 09:45–14:30 entries; 15:15 EOD |
 | Warmup | Seeded from broker 5-min candles at startup |
 | Scorecard | From 2026-08-21 |

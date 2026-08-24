@@ -1,6 +1,7 @@
 import sqlite3
 import pandas as pd
 from datetime import datetime
+from ist_time import ist_today
 import os
 
 from config import FALLBACK_LOT_SIZE
@@ -38,7 +39,7 @@ def generate_daily_summary():
         df['entry_dt'] = df['entry_time'].apply(parse_time_to_ist)
         df['exit_dt'] = df['exit_time'].apply(parse_time_to_ist)
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = ist_today()
         df['date_str'] = df['entry_dt'].dt.strftime('%Y-%m-%d')
         today_df = df[df['date_str'] == today_str].copy()
 
