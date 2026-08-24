@@ -165,11 +165,14 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertEqual(RISK["volume_sma_bars"], 8)
         self.assertEqual(RISK["volume_mult"], 1.2)
         self.assertEqual(RISK["volume_hook_mult"], 1.0)
-        self.assertGreaterEqual(RISK["volume_ok_hold_sec"], 60)
+        self.assertGreaterEqual(RISK["volume_ok_hold_sec"], 300)
+        self.assertEqual(RISK["signal_bar_sec"], 300)
+        self.assertGreaterEqual(RISK["breakout_max_age_sec"], 600)
         self.assertTrue(RISK["trend_cont_requires_expansion"])
         self.assertGreaterEqual(RISK["paper_max_daily_entries"], 12)
         self.assertLessEqual(RISK["max_trend_entries_per_day"], RISK["paper_max_daily_entries"])
-        from config import PAPER_TRADING, daily_entry_cap
+        from config import PAPER_TRADING, daily_entry_cap, signal_bar_sec
+        self.assertEqual(signal_bar_sec(), 300)
         if PAPER_TRADING:
             self.assertEqual(daily_entry_cap(), RISK["paper_max_daily_entries"])
         else:
@@ -177,19 +180,21 @@ class TestAlgoEngineCore(unittest.TestCase):
 
     def test_volume_gate_ltq_fallback_and_sticky_hold(self):
         import time as time_mod
+        from config import signal_bar_sec
 
         gate = VolumeExpansionGate()
         gate.mark_subscribed("NIFTY", True)
         now = time_mod.time()
+        bar = signal_bar_sec()
         gate.last_bar_time["NIFTY"] = now
-        gate.last_bar_minute["NIFTY"] = int(now // 60)
+        gate.last_bar_bucket["NIFTY"] = 100
         gate.last_session_vol["NIFTY"] = 1000.0
         gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0)
         self.assertEqual(gate.forming_vol["NIFTY"], 12.0)
 
         gate.forming_vol["NIFTY"] = 80.0
-        gate.last_bar_time["NIFTY"] = now - 61
-        gate.last_bar_minute["NIFTY"] = int(now // 60) - 1
+        gate.last_bar_time["NIFTY"] = now - (bar + 1)
+        gate.last_bar_bucket["NIFTY"] = 99
         gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=4.0)
         self.assertEqual(gate.closed_volumes["NIFTY"][-1], 80.0)
 
@@ -374,6 +379,30 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertTrue(fired)
         self.assertEqual(om.calls[0]["entry_reason"], "TREND_CONT")
 
+    def test_signal_bars_close_on_5min_not_1min(self):
+        import time as time_mod
+        from config import signal_bar_bucket, signal_bar_sec
+
+        brain = StrategyBrain(order_engine=None, options_builders={}, db_manager=None)
+        now = time_mod.time()
+        cur_bucket = signal_bar_bucket(now)
+        brain.last_candle_times["NIFTY"] = now
+        brain.last_signal_buckets["NIFTY"] = cur_bucket
+        brain.price_histories["NIFTY"] = [24200.0 + i for i in range(25)]
+        # Same signal bucket: only updates forming close
+        before = list(brain.price_histories["NIFTY"])
+        brain.evaluate_tick("NIFTY", 24300.0)
+        self.assertEqual(len(brain.price_histories["NIFTY"]), len(before))
+        self.assertEqual(brain.price_histories["NIFTY"][-1], 24300.0)
+
+        # Force a signal-bar roll via elapsed time + prior bucket
+        brain.last_candle_times["NIFTY"] = now - (signal_bar_sec() + 1)
+        brain.last_signal_buckets["NIFTY"] = cur_bucket - 1
+        n = len(brain.price_histories["NIFTY"])
+        brain.evaluate_tick("NIFTY", 24310.0)
+        self.assertEqual(len(brain.price_histories["NIFTY"]), n + 1)
+        self.assertEqual(brain.price_histories["NIFTY"][-1], 24310.0)
+
     def test_trend_soft_cap_still_allows_volume_breakout(self):
         class FakeAPI:
             def ltpData(self, *a, **k):
@@ -442,7 +471,7 @@ class TestAlgoEngineCore(unittest.TestCase):
         gate = VolumeExpansionGate()
         gate.mark_subscribed("NIFTY", True)
         gate.last_bar_time["NIFTY"] = 1.0
-        gate.last_bar_minute["NIFTY"] = 1
+        gate.last_bar_bucket["NIFTY"] = 1
         gate.last_session_vol["NIFTY"] = 1000.0
         gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0, sequence_number=10)
         gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0, sequence_number=10)
