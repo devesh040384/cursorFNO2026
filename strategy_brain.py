@@ -70,6 +70,7 @@ class VolumeExpansionGate:
         }
 
     def allows_entry(self, symbol):
+        """Hook path: average-or-better futures volume (or sticky post-breakout hold)."""
         if not RISK.get("require_volume_expansion", True):
             return True
         if not self.subscribed.get(symbol):
@@ -80,6 +81,19 @@ class VolumeExpansionGate:
         if rv is None:
             return False
         return rv >= float(RISK.get("volume_hook_mult", 1.0))
+
+    def allows_expansion(self, symbol):
+        """TREND_CONT / breakout-grade: sticky hold or rvol >= volume_mult."""
+        if not RISK.get("require_volume_expansion", True):
+            return True
+        if not self.subscribed.get(symbol):
+            return False
+        if time.time() < float(self.volume_ok_until.get(symbol) or 0.0):
+            return True
+        rv = self.rvol(symbol)
+        if rv is None:
+            return False
+        return rv >= float(RISK.get("volume_mult", 1.2))
 
     def has_fresh_breakout(self, symbol, max_age_sec=180.0):
         ts = self.breakout_event.get(symbol)
@@ -283,7 +297,12 @@ class StrategyBrain:
             opt_ltp = float(ltp_resp["data"]["ltp"])
 
             if not self.risk.assess_order_safety(
-                {"qty": qty, "index_name": symbol, "symbol": opt_symbol},
+                {
+                    "qty": qty,
+                    "index_name": symbol,
+                    "symbol": opt_symbol,
+                    "entry_reason": entry_reason,
+                },
                 estimated_premium=opt_ltp,
             ):
                 return False
@@ -361,22 +380,29 @@ class StrategyBrain:
             )
         return bool(ok)
 
+    def _volume_ok_for_reason(self, symbol, reason):
+        """TREND_CONT needs expansion; RSI_HOOK may use the softer hook gate."""
+        if reason == "TREND_CONT" and RISK.get("trend_cont_requires_expansion", True):
+            return self.volume_gate.allows_expansion(symbol)
+        return self.volume_gate.allows_entry(symbol)
+
     def _try_trend_entries(self, symbol, last_close, prev_close, macro_trend, config, last_rsi, current_rsi):
         recent_rsis = self.closed_rsi.get(symbol, [])
         rsi_dipped_bullish = any(r < 45 for r in recent_rsis)
         rsi_spiked_bearish = any(r > 55 for r in recent_rsis)
         cont_max = float(RISK.get("trend_cont_rsi_max", 68.0))
-        vol_ok = self.volume_gate.allows_entry(symbol)
 
         if macro_trend == "BULLISH":
             hook = last_rsi < 50 and current_rsi >= 50 and rsi_dipped_bullish
             cont = last_close > prev_close and 50.0 <= current_rsi <= cont_max
             if not hook and not cont:
                 return False
-            if not vol_ok:
-                logging.info(f"[{symbol}] CE skipped: {self.volume_gate.snapshot(symbol)['reason']}")
-                return False
             reason = "RSI_HOOK" if hook else "TREND_CONT"
+            if not self._volume_ok_for_reason(symbol, reason):
+                snap = self.volume_gate.snapshot(symbol)
+                need = "expansion" if reason == "TREND_CONT" else "hook"
+                logging.info(f"[{symbol}] CE {reason} skipped ({need}): {snap['reason']}")
+                return False
             logging.info(f"[{symbol}] Closed-bar CE ({reason}): trend up rsi={current_rsi:.1f}")
             return self._trigger_entry(
                 symbol, last_close, "CE",
@@ -389,10 +415,12 @@ class StrategyBrain:
             cont = last_close < prev_close and (100.0 - cont_max) <= current_rsi <= 50.0
             if not hook and not cont:
                 return False
-            if not vol_ok:
-                logging.info(f"[{symbol}] PE skipped: {self.volume_gate.snapshot(symbol)['reason']}")
-                return False
             reason = "RSI_HOOK" if hook else "TREND_CONT"
+            if not self._volume_ok_for_reason(symbol, reason):
+                snap = self.volume_gate.snapshot(symbol)
+                need = "expansion" if reason == "TREND_CONT" else "hook"
+                logging.info(f"[{symbol}] PE {reason} skipped ({need}): {snap['reason']}")
+                return False
             logging.info(f"[{symbol}] Closed-bar PE ({reason}): trend down rsi={current_rsi:.1f}")
             return self._trigger_entry(
                 symbol, last_close, "PE",
@@ -401,7 +429,7 @@ class StrategyBrain:
             )
 
         if RISK.get("enable_choppy_entries") and macro_trend == "CHOPPY":
-            if not vol_ok:
+            if not self.volume_gate.allows_entry(symbol):
                 return False
             if last_rsi < 80 and current_rsi >= 80:
                 return self._trigger_entry(

@@ -14,7 +14,11 @@ RISK = {
     "max_consecutive_losses": 3,
     "max_open_per_index": 1,
     "max_open_total": 2,
+    # Live stays tight; paper must not burn the day on early TREND_CONT noise (Aug 24 miss).
     "max_daily_entries": 4,
+    "paper_max_daily_entries": 12,
+    # Soft cap on TREND_CONT/RSI_HOOK so VOLUME_BREAKOUT still has room under the daily budget.
+    "max_trend_entries_per_day": 4,
     "session_start_hhmm": 945,
     "entry_cutoff_hhmm": 1430,
     "eod_squareoff_hhmm": 1515,
@@ -27,14 +31,23 @@ RISK = {
     "enable_volume_breakout": True,
     "enable_volume_breakout_in_chop": True,
     "volume_sma_bars": 8,
-    # 1-min futures: 1.5x almost never prints; breakout uses volume_mult, RSI hook uses hook_mult
+    # 1-min futures: breakout uses volume_mult; RSI hook may use hook_mult
     "volume_mult": 1.2,
     "volume_hook_mult": 1.0,
     "volume_ok_hold_sec": 180,
+    # Aug 24: TREND_CONT with only rvol>=1.0 fired into chop; require real expansion.
+    "trend_cont_requires_expansion": True,
     "trend_cont_rsi_max": 68.0,
     "min_option_volume": 500.0,
     "max_option_spread_pct": 3.0,
 }
+
+
+def daily_entry_cap():
+    """Paper uses a higher budget so early noise cannot exhaust the session."""
+    if PAPER_TRADING:
+        return int(RISK.get("paper_max_daily_entries", RISK["max_daily_entries"]))
+    return int(RISK["max_daily_entries"])
 
 # Fallback lot sizes if scrip master omits lotsize (must match current NSE/BSE lots)
 FALLBACK_LOT_SIZE = {
