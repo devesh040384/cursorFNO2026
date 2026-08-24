@@ -3,19 +3,19 @@ import json
 import os
 import logging
 from datetime import datetime, timedelta
-from config import FALLBACK_LOT_SIZE, INDICES_CONFIG, RISK
+from config import FALLBACK_LOT_SIZE, INDICES_CONFIG, RISK, signal_bar_bucket, signal_bar_sec
 from risk_manager import RiskManager
 from indicators import wilder_rsi, volume_expanded
 
 
 class VolumeExpansionGate:
-    """1-minute futures volume vs SMA. Fail closed until sma_bars and a live subscribe."""
+    """Signal-bar futures volume vs SMA (default 5-min). Fail closed until sma_bars + subscribe."""
 
     def __init__(self):
         self.closed_volumes = {symbol: [] for symbol in INDICES_CONFIG.keys()}
         self.forming_vol = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
         self.last_bar_time = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
-        self.last_bar_minute = {symbol: None for symbol in INDICES_CONFIG.keys()}
+        self.last_bar_bucket = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.last_session_vol = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.subscribed = {symbol: False for symbol in INDICES_CONFIG.keys()}
         self.volume_ok = {symbol: False for symbol in INDICES_CONFIG.keys()}
@@ -24,6 +24,9 @@ class VolumeExpansionGate:
         self.zero_bar_streak = {symbol: 0 for symbol in INDICES_CONFIG.keys()}
         self.last_seq = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.last_tick_sig = {symbol: None for symbol in INDICES_CONFIG.keys()}
+
+    def _breakout_age(self):
+        return float(RISK.get("breakout_max_age_sec", max(signal_bar_sec() * 2, 600)))
 
     def mark_subscribed(self, symbol, ok=True):
         self.subscribed[symbol] = bool(ok)
@@ -51,6 +54,7 @@ class VolumeExpansionGate:
         need = int(RISK.get("volume_sma_bars", 20))
         rv = self.rvol(symbol)
         ok = self.allows_entry(symbol)
+        bar_m = max(1, signal_bar_sec() // 60)
         if not self.subscribed.get(symbol):
             reason = "no-fut"
         elif len(hist) < need:
@@ -67,6 +71,7 @@ class VolumeExpansionGate:
             "rvol": rv,
             "ok": ok,
             "reason": reason,
+            "bar_min": bar_m,
         }
 
     def allows_entry(self, symbol):
@@ -95,7 +100,8 @@ class VolumeExpansionGate:
             return False
         return rv >= float(RISK.get("volume_mult", 1.2))
 
-    def has_fresh_breakout(self, symbol, max_age_sec=180.0):
+    def has_fresh_breakout(self, symbol, max_age_sec=None):
+        max_age_sec = self._breakout_age() if max_age_sec is None else max_age_sec
         ts = self.breakout_event.get(symbol)
         if ts is None:
             return False
@@ -104,8 +110,9 @@ class VolumeExpansionGate:
             return False
         return True
 
-    def consume_breakout(self, symbol, max_age_sec=180.0):
+    def consume_breakout(self, symbol, max_age_sec=None):
         """Return True once for a fresh expansion; clears the event."""
+        max_age_sec = self._breakout_age() if max_age_sec is None else max_age_sec
         ts = self.breakout_event.get(symbol)
         self.breakout_event[symbol] = None
         if ts is None:
@@ -120,11 +127,12 @@ class VolumeExpansionGate:
             hist.pop(0)
         self.closed_volumes[symbol] = hist
 
+        bar_m = max(1, signal_bar_sec() // 60)
         if closed <= 0:
             self.zero_bar_streak[symbol] = self.zero_bar_streak.get(symbol, 0) + 1
             if self.zero_bar_streak[symbol] == 5:
                 logging.warning(
-                    f"[{symbol}] 1-min futures volume is 0 for 5 bars. "
+                    f"[{symbol}] {bar_m}-min futures volume is 0 for 5 bars. "
                     "Quote feed may be missing volume fields; entries stay blocked."
                 )
         else:
@@ -138,12 +146,12 @@ class VolumeExpansionGate:
         self.volume_ok[symbol] = expanded
         if expanded:
             self.breakout_event[symbol] = now
-            hold = float(RISK.get("volume_ok_hold_sec", 180))
+            hold = float(RISK.get("volume_ok_hold_sec", self._breakout_age()))
             self.volume_ok_until[symbol] = now + hold
         rv = self.rvol(symbol)
         rv_s = f"{rv:.2f}x" if rv is not None else "n/a"
         logging.info(
-            f"📊 [{symbol} 1M VOL] last={closed:.0f} rvol={rv_s} "
+            f"📊 [{symbol} {bar_m}M VOL] last={closed:.0f} rvol={rv_s} "
             f"bars={len(hist)}/{int(RISK.get('volume_sma_bars', 20))} "
             f"breakout={expanded} hook={self.allows_entry(symbol)}"
         )
@@ -154,10 +162,11 @@ class VolumeExpansionGate:
         if symbol not in INDICES_CONFIG:
             return
         now = time.time()
-        minute = int(now // 60)
+        bucket = signal_bar_bucket(now)
+        bar_sec = signal_bar_sec()
         if self.last_bar_time[symbol] == 0.0:
             self.last_bar_time[symbol] = now
-            self.last_bar_minute[symbol] = minute
+            self.last_bar_bucket[symbol] = bucket
 
         if sequence_number is not None:
             if sequence_number == self.last_seq.get(symbol):
@@ -184,12 +193,12 @@ class VolumeExpansionGate:
         elif last_traded_qty is not None:
             increment = max(0.0, float(last_traded_qty))
 
-        last_minute = self.last_bar_minute[symbol]
-        clock_rolled = last_minute is not None and minute != last_minute
-        elapsed_rolled = now - self.last_bar_time[symbol] >= 60
+        last_bucket = self.last_bar_bucket[symbol]
+        clock_rolled = last_bucket is not None and bucket != last_bucket
+        elapsed_rolled = now - self.last_bar_time[symbol] >= bar_sec
         if clock_rolled or elapsed_rolled:
             self._close_volume_bar(symbol, now, increment)
-            self.last_bar_minute[symbol] = minute
+            self.last_bar_bucket[symbol] = bucket
         else:
             self.forming_vol[symbol] += increment
 
@@ -206,6 +215,7 @@ class StrategyBrain:
         self.price_histories = {symbol: [] for symbol in INDICES_CONFIG.keys()}
         self.closed_rsi = {symbol: [] for symbol in INDICES_CONFIG.keys()}
         self.last_candle_times = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
+        self.last_signal_buckets = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.cooldown_until = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
         self.last_closed_rsi = {symbol: 50.0 for symbol in INDICES_CONFIG.keys()}
         self.current_regimes = {symbol: "INITIALIZING" for symbol in INDICES_CONFIG.keys()}
@@ -235,6 +245,7 @@ class StrategyBrain:
                     "price_histories": self.price_histories,
                     "last_closed_rsi": self.last_closed_rsi,
                     "last_candle_times": self.last_candle_times,
+                    "signal_bar_sec": signal_bar_sec(),
                 }, f)
         except Exception as e:
             logging.error(f"❌ Error saving StrategyBrain state: {e}")
@@ -248,6 +259,13 @@ class StrategyBrain:
                 state = json.load(f)
             if state.get("date", "") != today_str:
                 return
+            # Drop histories built on a different / unknown bar size (e.g. old 1-min state).
+            saved_bar = state.get("signal_bar_sec")
+            if saved_bar is None or int(saved_bar) != signal_bar_sec():
+                logging.info(
+                    f"Ignoring rsi_state.json: bar size {saved_bar} != current {signal_bar_sec()}s"
+                )
+                return
             loaded = state.get("price_histories", {})
             for symbol in INDICES_CONFIG.keys():
                 if symbol in loaded:
@@ -260,6 +278,7 @@ class StrategyBrain:
             now = time.time()
             for symbol in INDICES_CONFIG.keys():
                 self.last_candle_times[symbol] = now
+                self.last_signal_buckets[symbol] = signal_bar_bucket(now)
         except Exception as e:
             logging.error(f"❌ Error loading StrategyBrain state: {e}")
 
@@ -446,28 +465,38 @@ class StrategyBrain:
         return False
 
     def evaluate_tick(self, symbol, spot_price, option_volume=None):
+        """Update forming signal bar on every tick; entries only on closed signal bars (5-min)."""
         if symbol not in INDICES_CONFIG:
             return
         current_time = time.time()
         now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
         current_hour_min = now_ist.hour * 100 + now_ist.minute
+        bar_sec = signal_bar_sec()
+        bucket = signal_bar_bucket(current_time)
 
         history = self.price_histories.get(symbol, [])
         state_changed = False
         closed_bar = False
 
         last_candle_time = self.last_candle_times.get(symbol, 0.0)
-        if current_time - last_candle_time >= 60:
+        last_bucket = self.last_signal_buckets.get(symbol)
+        bucket_rolled = last_bucket is not None and bucket != last_bucket
+        elapsed_rolled = current_time - last_candle_time >= bar_sec
+        if bucket_rolled or elapsed_rolled:
             if history:
                 closed_bar = True
             history.append(spot_price)
-            if len(history) > 375:
+            # ~1 trading day of signal bars with headroom
+            max_bars = max(80, 375 * 60 // bar_sec)
+            if len(history) > max_bars:
                 history.pop(0)
             self.last_candle_times[symbol] = current_time
+            self.last_signal_buckets[symbol] = bucket
             state_changed = True
         elif len(history) == 0:
             history.append(spot_price)
             self.last_candle_times[symbol] = current_time
+            self.last_signal_buckets[symbol] = bucket
             state_changed = True
         else:
             history[-1] = spot_price
@@ -490,10 +519,10 @@ class StrategyBrain:
         self.current_regimes[symbol] = macro_trend
 
         if closed_bar:
-            bucket = self.closed_rsi.setdefault(symbol, [])
-            bucket.append(current_rsi)
-            if len(bucket) > 5:
-                bucket.pop(0)
+            rsi_bucket = self.closed_rsi.setdefault(symbol, [])
+            rsi_bucket.append(current_rsi)
+            if len(rsi_bucket) > 5:
+                rsi_bucket.pop(0)
 
         if current_hour_min < RISK["session_start_hhmm"] or current_hour_min >= RISK["entry_cutoff_hhmm"]:
             if closed_bar:
@@ -509,8 +538,9 @@ class StrategyBrain:
         if not closed_bar:
             return
 
+        bar_m = max(1, bar_sec // 60)
         logging.info(
-            f"[{symbol}] Closed bar {macro_trend} px={last_close:.2f} "
+            f"[{symbol}] Closed {bar_m}m bar {macro_trend} px={last_close:.2f} "
             f"ema9={ema_9:.1f} ema21={ema_21:.1f} mean20={loc_mean:.1f} rsi={current_rsi:.1f} "
             f"| Vol {self.volume_gate.snapshot(symbol)['reason']}"
         )
