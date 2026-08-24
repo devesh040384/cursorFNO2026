@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import time
 from datetime import datetime
 from risk_manager import RiskManager
 from config import RISK, INDICES_CONFIG
@@ -500,6 +501,79 @@ class TestAlgoEngineCore(unittest.TestCase):
             self.assertEqual(db.count_open_trades(), 1)
         finally:
             os.remove(path)
+
+
+class FakeCandleAPI:
+    """Emits synthetic 5-min candles ending at the last closed IST bucket."""
+
+    def __init__(self, bars=60, base=24000.0, vol=100000.0):
+        self.bars = bars
+        self.base = base
+        self.vol = vol
+        self.calls = []
+
+    def getCandleData(self, params):
+        from datetime import datetime, timedelta, timezone
+
+        self.calls.append(params)
+        ist = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(timezone.utc).astimezone(ist)
+        bar = timedelta(seconds=300)
+        # Align to the current (still forming) bucket start.
+        secs = now.hour * 3600 + now.minute * 60 + now.second
+        cur_start = now - timedelta(seconds=secs % 300, microseconds=now.microsecond)
+        data = []
+        for i in range(self.bars, -1, -1):  # includes the forming bar
+            ts = cur_start - bar * i
+            px = self.base + (self.bars - i)
+            data.append([ts.isoformat(), px, px + 5, px - 5, px + 1, self.vol])
+        return {"status": True, "data": data}
+
+
+class HistorySeedTests(unittest.TestCase):
+    def test_seed_fills_price_and_volume_history(self):
+        import history_seeder
+        from config import signal_bar_bucket
+
+        brain = StrategyBrain(order_engine=None, options_builders={})
+        api = FakeCandleAPI()
+        futs = {"NIFTY": {"token": "5001", "exchange": "NFO", "symbol": "NIFTY26AUGFUT"}}
+        history_seeder.seed_all(api, brain, futs, symbols=["NIFTY"])
+
+        hist = brain.price_histories["NIFTY"]
+        # 60 closed bars + 1 placeholder for the forming bar.
+        self.assertEqual(len(hist), 61)
+        self.assertGreaterEqual(len(hist) - 1, 22)
+        self.assertEqual(hist[-1], hist[-2])
+        self.assertEqual(len(brain.closed_rsi["NIFTY"]), 5)
+        self.assertNotEqual(brain.last_closed_rsi["NIFTY"], 50.0)
+
+        gate = brain.volume_gate
+        self.assertGreaterEqual(len(gate.closed_volumes["NIFTY"]), int(RISK["volume_sma_bars"]))
+        self.assertIsNone(gate.last_session_vol["NIFTY"])
+        # Seeded history must never carry a stale breakout into the live session.
+        self.assertIsNone(gate.breakout_event["NIFTY"])
+        self.assertFalse(gate.has_fresh_breakout("NIFTY"))
+        # Bar clock parked on the current bucket so the first tick is not a close.
+        self.assertEqual(brain.last_signal_buckets["NIFTY"], signal_bar_bucket(time.time()))
+
+    def test_forming_bar_is_excluded(self):
+        import history_seeder
+
+        api = FakeCandleAPI(bars=30)
+        rows = history_seeder.fetch_candles(api, "NSE", "26000", "FIVE_MINUTE")
+        closed = history_seeder._drop_forming_bar(rows)
+        self.assertEqual(len(closed), len(rows) - 1)
+
+    def test_partial_first_volume_bar_is_discarded(self):
+        gate = VolumeExpansionGate()
+        gate.mark_subscribed("NIFTY", True)
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0)
+        gate.on_fut_tick("NIFTY", volume_traded_today=5000.0)
+        gate.last_bar_time["NIFTY"] = time.time() - 400
+        gate.on_fut_tick("NIFTY", volume_traded_today=6000.0)
+        self.assertEqual(gate.closed_volumes["NIFTY"], [])
+        self.assertFalse(gate.partial_first_bar["NIFTY"])
 
 
 if __name__ == "__main__":

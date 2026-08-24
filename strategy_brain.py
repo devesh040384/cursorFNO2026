@@ -3,6 +3,7 @@ import json
 import os
 import logging
 from datetime import datetime, timedelta
+from datetime import timezone
 from config import FALLBACK_LOT_SIZE, INDICES_CONFIG, RISK, signal_bar_bucket, signal_bar_sec
 from risk_manager import RiskManager
 from indicators import wilder_rsi, volume_expanded
@@ -24,6 +25,9 @@ class VolumeExpansionGate:
         self.zero_bar_streak = {symbol: 0 for symbol in INDICES_CONFIG.keys()}
         self.last_seq = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.last_tick_sig = {symbol: None for symbol in INDICES_CONFIG.keys()}
+        # First live bar starts mid-bucket: its partial volume would drag the SMA
+        # down and fake an expansion on the next bar. Discard it once.
+        self.partial_first_bar = {symbol: False for symbol in INDICES_CONFIG.keys()}
 
     def _breakout_age(self):
         return float(RISK.get("breakout_max_age_sec", max(signal_bar_sec() * 2, 600)))
@@ -121,6 +125,12 @@ class VolumeExpansionGate:
 
     def _close_volume_bar(self, symbol, now, increment):
         closed = self.forming_vol[symbol]
+        if self.partial_first_bar.get(symbol):
+            self.partial_first_bar[symbol] = False
+            self.forming_vol[symbol] = increment
+            self.last_bar_time[symbol] = now
+            logging.info(f"[{symbol}] Discarded partial first futures volume bar ({closed:.0f}).")
+            return
         hist = self.closed_volumes[symbol]
         hist.append(closed)
         if len(hist) > 80:
@@ -167,6 +177,8 @@ class VolumeExpansionGate:
         if self.last_bar_time[symbol] == 0.0:
             self.last_bar_time[symbol] = now
             self.last_bar_bucket[symbol] = bucket
+            # Only partial if we joined mid-bucket with no seeded history.
+            self.partial_first_bar[symbol] = not self.closed_volumes.get(symbol)
 
         if sequence_number is not None:
             if sequence_number == self.last_seq.get(symbol):
@@ -236,15 +248,21 @@ class StrategyBrain:
             ema = (price - ema) * multiplier + ema
         return ema
 
+    @staticmethod
+    def _ist_today():
+        ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+        return ist.strftime("%Y-%m-%d")
+
     def _save_state(self):
         try:
-            today_str = datetime.now().strftime("%Y-%m-%d")
+            today_str = self._ist_today()
             with open(self.state_file, "w") as f:
                 json.dump({
                     "date": today_str,
                     "price_histories": self.price_histories,
                     "last_closed_rsi": self.last_closed_rsi,
                     "last_candle_times": self.last_candle_times,
+                    "closed_rsi": self.closed_rsi,
                     "signal_bar_sec": signal_bar_sec(),
                 }, f)
         except Exception as e:
@@ -254,7 +272,7 @@ class StrategyBrain:
         if not os.path.exists(self.state_file):
             return
         try:
-            today_str = datetime.now().strftime("%Y-%m-%d")
+            today_str = self._ist_today()
             with open(self.state_file, "r") as f:
                 state = json.load(f)
             if state.get("date", "") != today_str:
@@ -271,6 +289,10 @@ class StrategyBrain:
                 if symbol in loaded:
                     self.price_histories[symbol] = loaded[symbol]
             self.last_closed_rsi = state.get("last_closed_rsi", self.last_closed_rsi)
+            loaded_rsi = state.get("closed_rsi") or {}
+            for symbol in INDICES_CONFIG.keys():
+                if symbol in loaded_rsi:
+                    self.closed_rsi[symbol] = list(loaded_rsi[symbol])[-5:]
             # backward compat with older state key
             if "last_arsis" in state and "last_closed_rsi" not in state:
                 self.last_closed_rsi = state.get("last_arsis", self.last_closed_rsi)

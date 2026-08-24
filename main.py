@@ -19,6 +19,7 @@ from order_execution import OrderExecutionEngine
 from strategy_brain import StrategyBrain
 from risk_monitors import TrailingStopLossMonitor, TradeReconciler
 from rate_limiter import RateLimitedAPI
+from history_seeder import seed_all
 
 # Disable raw binary frame tracing to prevent terminal flooding
 websocket.enableTrace(False)
@@ -263,11 +264,13 @@ def main():
 
     fut_token_to_index = {}
     fut_subscriptions = []
+    futures_by_symbol = {}
     for symbol in ACTIVE_INDICES:
         cfg = INDICES_CONFIG[symbol]
         builder = options_builders.get(str(cfg["index_token"]))
         fut = builder.get_nearest_expiry_future() if builder else None
         if fut and fut.get("token"):
+            futures_by_symbol[symbol] = fut
             fut_token_to_index[str(fut["token"])] = symbol
             fut_subscriptions.append({
                 "exchangeType": int(cfg.get("fut_exchange_type") or fut.get("exchange_type") or 2),
@@ -280,6 +283,13 @@ def main():
             if RISK.get("require_volume_expansion", True):
                 logging.error(f"Volume gate: no future for {symbol}. New entries blocked until resolved.")
     
+    # Seed 5-min bar history from broker candles: without this the bot needs
+    # 22 live bars (~110 min) before it can trade, wasting the 09:45-11:35 window.
+    try:
+        seed_all(smart_api, strategy_brain, futures_by_symbol, symbols=ACTIVE_INDICES)
+    except Exception as e:
+        logging.error(f"❌ History seeding failed; falling back to live warmup: {e}")
+
     tsl_monitor = TrailingStopLossMonitor(
         db_manager=db_manager,
         smart_api=smart_api,
