@@ -172,23 +172,74 @@ expansion windows sit inside it.
 | PR | Status | Notes |
 |----|--------|--------|
 | #2 | Draft | Cloud Agent / env setup |
-| #7 | (this docs PR) | README + CHANGELOG |
+| — | Unmerged | `feat/seed-5min-history` — seeding, IST fixes, per-index cap, DTE instrumentation, +30% target + trail ladder |
 
 ---
 
-## Current feature snapshot (post #6)
+## Current feature snapshot
 
 | Area | Status |
 |------|--------|
 | Indices | NIFTY + SENSEX |
 | Paper mode | Default ON |
 | Signal bar | 5-min IST |
+| Warmup | **Seeded from broker 5-min candles at startup** (entries live from 09:45) |
 | Exit monitors | Tick / ~5s |
 | Entries | VOLUME_BREAKOUT → TREND_CONT / RSI_HOOK |
 | Choppy extreme RSI | OFF |
-| Volume gate | Futures RVOL, sticky hold, tick dedupe |
+| Volume gate | Futures RVOL, sticky hold, tick dedupe, partial/gap bars discarded |
 | Liquidity | Volume + real depth spread (no fake 2%) |
-| Risk | Loss/streak halt, open caps, paper 12 / live 4 daily, per-index 6/3, trend soft-cap 4 |
+| Contract | ATM, `min_dte = 0` (0-DTE allowed); expiry/DTE recorded per trade |
+| Target / SL | **+30% / −10%** (3:1) |
+| Trail | 5-tier ladder: +4% BE, +8% ×1.02, +15% 50% peak, +22% 65%, +26% 75% |
+| Risk | Loss/streak halt, open caps, paper 12 / live 4 daily, **per-index 6/3**, trend soft-cap 4 |
 | Session | 09:45–14:30 entries; 15:15 EOD |
-| Warmup | Seeded from broker 5-min candles at startup |
-| Scorecard | From 2026-08-21 |
+| Timezone | All wall-clock via `ist_time.py` (host-local never used) |
+| Scorecard | From 2026-08-21; adds `by DTE` + runner capture |
+| Tests | 37 in `test_suite.py` |
+
+---
+
+## Measured baseline (7d to 2026-08-24, paper)
+
+39 trades · 41% win rate · PnL ₹3,852 · profit factor 1.83 · expectancy ₹99/trade
+· max DD ₹1,541.
+
+Decomposed (the `STOP_LOSS_HIT` bucket splits, because a trailed stop fires above entry):
+
+| Bucket | n | PnL | avg |
+|--------|---|-----|-----|
+| TARGET_HIT | 7 | +7,271 | **+1,039** |
+| Trailed winners | 9 | +1,204 | **+134** |
+| Real stop-outs | 20 | −4,314 | −216 |
+| Breakeven | 1 | 0 | 0 |
+| TIME_STOP | 2 | −309 | −154 |
+
+Per index: NIFTY n=18 ₹605 (avg **₹33.6**) · SENSEX n=21 ₹3,248 (avg **₹154.7**).
+Per reason: VOLUME_BREAKOUT n=32 ₹2,518 · TREND_CONT n=7 ₹1,335 · **RSI_HOOK n=0**.
+
+Three things this baseline says:
+
+1. **TARGET_HIT is 18% of trades but 189% of net PnL.** Everything else nets
+   −₹3,418. Seven trades carry the week.
+2. **Trailed winners average ₹134 vs ₹1,039 for target hits** — an 8× gap. Every
+   one had run ≥ +4%. This drove the upper trail tiers.
+3. **max DD ₹1,541 ≈ the ₹1,500 daily loss limit.** The circuit breaker is sitting
+   at the observed worst drawdown and will start tripping.
+
+---
+
+## Open questions (not yet answerable from data)
+
+| Question | Blocked on | Status |
+|----------|-----------|--------|
+| Does 0-DTE cause the NIFTY underperformance? | `dte` per trade | instrumented, **0 rows** |
+| Are runners being captured? | `max_favorable_price` | instrumented, **0 rows** |
+| Do +22% winners continue to +30%? | same | **assumed 53% break-even, unmeasured** |
+| Is `time_stop_minutes = 25` too short for a +30% target? | above | unchanged, flagged |
+| Why has `RSI_HOOK` never fired? | — | cross condition is narrow on 5-min bars |
+
+The +30% target and the trail ladder are **reasoned bets, not backtested results.**
+Worst case if no +22% winner continues is −₹2,974 against a ₹3,852 week — a flat
+week, not a blow-up, and no trade converts from win to loss. Treat the first week
+after merge as the experiment that validates or kills them.

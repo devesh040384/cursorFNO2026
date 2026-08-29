@@ -65,6 +65,21 @@ back to the old live warmup — it does not trade on partial history.
 - **5-min IST closed bars** → regime, `VOLUME_BREAKOUT`, `TREND_CONT`, `RSI_HOOK`, futures RVOL  
 - **Tick / monitor loop** → LTP, trailing SL, time-stop, EOD  
 
+**Feed integrity**
+
+The strategy only trades on bars it believes are clean:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Joined mid-bucket, no seed | First futures volume bar is **discarded** (a partial bar would drag the RVOL average down and fake a breakout on the next bar) |
+| Feed gap over N bars (reconnect) | Volume: partial bar dropped, sticky expansion cleared. Price: entries **paused for N clean bars** (`stale_bars`, capped at 22) |
+| Decoded spot outside `spot_min`/`spot_max` | Tick **dropped and logged**, never reaches the strategy |
+| Duplicate futures tick | Deduped on `sequence_number`, else on `(volume_today, last_qty)` |
+
+All wall-clock comes from `ist_time.py` — session windows, DB stamps, scorecard
+buckets and expiry comparisons. Host-local time is never used, so a UTC VPS
+behaves identically to an IST desktop.
+
 ---
 
 ## Strategies (entry logic)
@@ -101,9 +116,15 @@ Priority on each **closed 5-min** bar: **VOLUME_BREAKOUT** first, then trend pat
 
 ### Contract selection
 
-- Nearest ATM CE/PE with **DTE >= `min_dte`** (default 0 = expiry day allowed)
+- Nearest ATM CE/PE with **DTE ≥ `min_dte`**
+- `min_dte = 0` (default) allows **expiry-day / 0-DTE** contracts. At 0 DTE theta
+  alone can walk a position into the −10% stop with no adverse spot move; set
+  `1` to skip expiry day or `2` to force the next weekly. Trade-off: higher DTE
+  means lower gamma, so **+30% is slower to reach**.
 - Liquidity: min option volume 500; spread ≤ 3% when depth exists (no invented 2% spread)
 - Targets / SL (trending): **+30% / −10%** (3:1)
+- `expiry`, `dte` and `max_favorable_price` are stored on every trade so the DTE
+  question can be answered from data instead of assumption
 
 After a fill: **15-min** per-index cooldown.
 
@@ -149,33 +170,108 @@ cap, trend soft-cap, max open per index / total, premium floor, notional ceiling
 
 ### Exits
 
-1. **TARGET_HIT** / **STOP_LOSS_HIT**  
-2. **Trailing ladder** (`RISK["trail_tiers"]`, each tier only ever raises the stop):
-   +4% → breakeven | +8% → entry×1.02 | +15% → 50% of peak | +22% → 65% of peak | +26% → 75% of peak  
+1. **TARGET_HIT** (+30%) / **STOP_LOSS_HIT**
+2. **Trailing ladder** — `RISK["trail_tiers"]`, evaluated cheapest-first, best
+   qualifying tier wins, and a tier can only ever **raise** the stop:
+
+   | Trade reaches | Stop moves to | Effect |
+   |---------------|---------------|--------|
+   | +4% | entry | breakeven |
+   | +8% | entry × 1.02 | +2% locked |
+   | +15% | entry + 50% of peak gain | |
+   | +22% | entry + 65% of peak gain | |
+   | +26% | entry + 75% of peak gain | a +30% peak exits at **+22.5%** |
+
+   The two lowest tiers are deliberately tight: they convert would-be −10%
+   losers into small wins. The upper tiers only touch trades already deep in
+   profit, so they can never turn a winner into a loser.
 3. **TIME_STOP** (25 min, gain &lt; 2%)  
 4. **EOD_SQUAREOFF** (15:15) — refuses exit if LTP missing / ₹0  
+
+> **Reading the scorecard:** `STOP_LOSS_HIT` mixes two very different outcomes,
+> because a trailed stop fires *above* entry. Split it by sign before drawing
+> conclusions — trailed winners and real stop-outs behave nothing alike.
 
 ---
 
 ## Key config (`config.py`)
 
 ```text
-signal_bar_sec            = 300      # 5-min signals
-breakout_max_age_sec      = 600
-volume_mult               = 1.2      # breakout / TREND_CONT
-volume_hook_mult          = 1.0      # RSI_HOOK
-volume_sma_bars           = 8
-volume_ok_hold_sec        = 600
-trend_cont_requires_expansion = True
-paper_max_daily_entries   = 12
-max_daily_entries         = 4
-max_trend_entries_per_day = 4
-max_daily_entries_per_index       = 3    # live
+# --- signal bars -------------------------------------------------------
+signal_bar_sec                    = 300     # 5-min signals
+breakout_max_age_sec              = 600     # ~2 signal bars
+
+# --- futures volume gate ----------------------------------------------
+require_volume_expansion          = True
+volume_mult                       = 1.2     # VOLUME_BREAKOUT / TREND_CONT
+volume_hook_mult                  = 1.0     # RSI_HOOK
+volume_sma_bars                   = 8
+volume_ok_hold_sec                = 600     # sticky post-breakout hold
+trend_cont_requires_expansion     = True
+trend_cont_rsi_max                = 68.0
+
+# --- entry budget ------------------------------------------------------
+max_daily_entries                 = 4       # live, all indices
+paper_max_daily_entries           = 12
+max_daily_entries_per_index       = 3       # live, per index
 paper_max_daily_entries_per_index = 6
-PAPER_TRADING             = True
-ACTIVE_INDICES            = NIFTY, SENSEX
-SCORECARD_SINCE           = 2026-08-21
+max_trend_entries_per_day         = 4       # TREND_CONT + RSI_HOOK soft cap
+max_open_per_index                = 1
+max_open_total                    = 2
+
+# --- circuit breaker (latching) ---------------------------------------
+max_daily_loss_inr                = 1500.0
+max_consecutive_losses            = 3
+
+# --- session (IST) -----------------------------------------------------
+session_start_hhmm                = 945
+entry_cutoff_hhmm                 = 1430
+eod_squareoff_hhmm                = 1515
+
+# --- contract ----------------------------------------------------------
+min_dte                           = 0       # 1 skips expiry day, 2 = next weekly
+min_option_premium                = 25.0
+max_premium_risk_inr              = 8000.0
+min_option_volume                 = 500.0
+max_option_spread_pct             = 3.0
+
+# --- exits -------------------------------------------------------------
+trending_target_mult              = 1.30    # per index, +30%
+trending_sl_mult                  = 0.90    # per index, -10%
+time_stop_minutes                 = 25
+time_stop_min_gain_mult           = 1.02
+trail_tiers                       = +4% breakeven | +8% x1.02
+                                    | +15% 50% peak | +22% 65% | +26% 75%
+
+# --- misc --------------------------------------------------------------
+PAPER_TRADING                     = True
+ACTIVE_INDICES                    = NIFTY, SENSEX
+SCORECARD_SINCE                   = 2026-08-21
+enable_choppy_entries             = False
 ```
+
+---
+
+## Monitoring
+
+**Heartbeat** (every 60s) reports per index: spot, regime, RVOL warmup, and the
+daily entry count against the per-index cap.
+
+```text
+[NIFTY] Spot: ₹24000.00 | Regime: BULLISH | Vol(5m): 24/8 1.31x OK |
+        Entries: 2/6 (open 1, closed 1, PnL ₹1170)
+```
+
+**Scorecard** (`python3 scorecard.py`) adds two diagnostics beyond PnL/win-rate:
+
+| Line | Answers |
+|------|---------|
+| `by DTE: DTE0 n=.. INR ..` | Does expiry-day (0-DTE) actually underperform? |
+| `runner capture N% of INR X available` | What share of the gain that was *on the table* did we keep? `max_favorable_price` vs realised. |
+| `trades >= INR 1500` | How many trades cleared the runner threshold? |
+
+Both are populated only for trades opened after the instrumentation landed;
+older rows have no `dte` / `max_favorable_price` and are excluded.
 
 ---
 
@@ -186,6 +282,14 @@ SCORECARD_SINCE           = 2026-08-21
 - Futures must resolve at startup or the volume gate blocks entries.
 - Seeding needs historical-data permission on the SmartAPI key; BFO (SENSEX) candle
   support is broker-dependent — check the `[seed]` lines in the log.  
-- Heartbeat logs spot, regime, volume warmup/`rvol`, and scorecard PnL.  
+- Heartbeat logs spot, regime, volume warmup/`rvol`, per-index entries and scorecard PnL.
+- **API pacing:** `RateLimitedAPI` serialises *all* REST calls at 1/sec behind one
+  lock — the TSL monitor (`ltpData` per open trade every 5s), the EOD monitor, the
+  entry path and startup seeding all share it. 429s are unlikely at this rate; the
+  real cost is that an entry's `ltpData` can queue ~1–2s behind monitor calls, which
+  is slippage against the signal-bar close. Worth measuring before widening.
+- **Verify the LTP decode on first run.** Websocket LTP is decoded as paise
+  (`/100`) unconditionally. Check the first `📈 Tick Received` line against the
+  real index level; an out-of-band value is dropped and logged, not traded.  
 
 Full change history: see **[CHANGELOG.md](CHANGELOG.md)**.
