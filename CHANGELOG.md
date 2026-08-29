@@ -4,6 +4,23 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-08-29 — Telegram notifier (standalone)
+
+- New `telegram_notifier.py`, a **separate process**. No existing file was
+  modified: it tails `trading_bot.log` rather than hooking the bot's logging, and
+  opens `trade_history.db` with a `mode=ro` URI so it cannot write to it.
+- Pushes entries, exits and every abort condition; urgent alerts bypass `/mute`.
+- Answers `/status`, `/open`, `/pnl`, `/trades`, `/log`, `/mute`, `/unmute` from
+  your phone. Only `TELEGRAM_CHAT_ID` is answered.
+- Follows `RotatingFileHandler` rotations (inode + truncation detection) and
+  starts at EOF, so restarting it never replays the day as a burst of messages.
+
+**Note:** this does *not* satisfy `ALERT_WEBHOOK_URL`. `broker_health.AlertHandler`
+posts `{"text": ...}`; Telegram requires `chat_id`. The two are independent, and
+preflight's live gate still checks the webhook separately.
+
+---
+
 ## 2026-08-29 — Sep 15 go-live prep
 
 - **`preflight_check.py` rewritten.** The old one could never pass: it required

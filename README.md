@@ -50,6 +50,7 @@ python3 -m unittest test_suite.py -v
 | `ist_time.py` | Single source of IST wall-clock (all dates/stamps) |
 | `broker_orders.py` | Confirms real fills from the order book (never assumes) |
 | `broker_health.py` | Session re-auth, log rotation, CRITICAL alerting |
+| `telegram_notifier.py` | **Separate process.** Telegram alerts + remote status. Touches no trading file. |
 | `config.py` | All live knobs |
 
 **Startup seeding**
@@ -316,6 +317,41 @@ daily entry count against the per-index cap.
 
 Both are populated only for trades opened after the instrumentation landed;
 older rows have no `dte` / `max_favorable_price` and are excluded.
+
+---
+
+## Telegram alerts (`telegram_notifier.py`)
+
+Runs as its **own process** next to `main.py`. It tails the log the bot already
+writes and answers commands from your phone. It imports nothing from the trading
+path for behaviour and opens the database **read-only**, so it cannot affect a trade.
+
+```bash
+# 1. @BotFather -> /newbot -> copy the token into .env as TELEGRAM_BOT_TOKEN
+# 2. message your bot once, then:
+python3 telegram_notifier.py --whoami     # prints TELEGRAM_CHAT_ID
+# 3. verify, then run it in its own tmux window
+python3 telegram_notifier.py --test
+python3 telegram_notifier.py
+```
+
+| Command | Returns |
+|---------|---------|
+| `/status` | Latest heartbeat: spot, regime, entries per index |
+| `/open` | Open trades with entry, target, SL |
+| `/pnl` | Today's realised PnL, per index, plus execution drag |
+| `/trades` | Last 5 closed trades |
+| `/log` | Recent WARNING/ERROR lines |
+| `/mute` `/unmute` | Pause routine alerts — emergencies still get through |
+
+Pushed automatically: entries, exits, and every abort condition
+(`UNTRACKED`, `CIRCUIT BREAKER`, unconfirmed order, partial exit, bad price feed,
+incomplete square-off). Only `TELEGRAM_CHAT_ID` is answered; other chats are ignored.
+
+> **`ALERT_WEBHOOK_URL` is a different mechanism.** `broker_health.AlertHandler`
+> posts `{"text": ...}`, which Telegram rejects — it needs `chat_id`. Pointing
+> that variable at a Telegram URL will not work, and preflight's live gate still
+> checks for it separately.
 
 ---
 
