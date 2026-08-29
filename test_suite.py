@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from risk_manager import RiskManager
 from config import RISK, INDICES_CONFIG
+from ist_time import ist_today
 from database import DatabaseManager
 from order_execution import OrderExecutionEngine
 from indicators import wilder_rsi, sma_rsi, volume_expanded, TechnicalIndicators
@@ -648,6 +649,18 @@ class FeedGapTests(unittest.TestCase):
         self.assertFalse(gate.has_fresh_breakout("NIFTY"))
         self.assertEqual(gate.volume_ok_until["NIFTY"], 0.0)
 
+    def test_absurd_gap_is_reported_as_a_clock_reset(self):
+        import logging
+        gate = VolumeExpansionGate()
+        gate.mark_subscribed("NIFTY", True)
+        gate.last_bar_time["NIFTY"] = 1.0   # epoch -> millions of "bars"
+        gate.last_bar_bucket["NIFTY"] = 1
+        with self.assertLogs(level="WARNING") as captured:
+            gate.on_fut_tick("NIFTY", volume_traded_today=1000.0)
+        joined = " ".join(captured.output)
+        self.assertIn("clock reset", joined)
+        self.assertNotIn("59600", joined)
+
     def test_price_gap_pauses_entries(self):
         brain = StrategyBrain(order_engine=None, options_builders={})
         brain.price_histories["NIFTY"] = [24000.0 + i for i in range(30)]
@@ -910,6 +923,97 @@ class SessionKeeperTests(unittest.TestCase):
         keeper.ensure()
         keeper.login_fn = lambda: None
         self.assertEqual(keeper.handle_error("session expired"), "good")
+
+
+class ViewCompletedTests(unittest.TestCase):
+    """The viewer was today-only and host-local; ranges must work and be IST."""
+
+    def setUp(self):
+        import sqlite3
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        DatabaseManager(self.path)
+        conn = sqlite3.connect(self.path)
+        rows = [
+            ("2026-08-24", "NIFTY26AUG24500CE", "NIFTY", 65, 100.0, 130.0, "TARGET_HIT"),
+            ("2026-08-25", "SENSEX26AUG81000PE", "SENSEX", 20, 200.0, 180.0, "STOP_LOSS_HIT"),
+            ("2026-08-26", "NIFTY26AUG24600CE", "NIFTY", 65, 80.0, 104.0, "TARGET_HIT"),
+        ]
+        for day, sym, idx, qty, ep, xp, xr in rows:
+            conn.execute(
+                "INSERT INTO trades (symbol, token, qty, exchange, index_name, entry_price,"
+                " status, exit_price, exit_reason, entry_reason, timestamp, entry_time)"
+                " VALUES (?,?,?,?,?,?,'CLOSED',?,?,'VOLUME_BREAKOUT',?,?)",
+                (sym, "1", qty, "NFO", idx, ep, xp, xr, day + " 10:15:00", day + " 10:15:00"),
+            )
+        conn.execute(
+            "INSERT INTO trades (symbol, token, qty, exchange, index_name, entry_price,"
+            " status, entry_reason, timestamp, entry_time)"
+            " VALUES ('NIFTY26SEP24700CE','9',65,'NFO','NIFTY',90.0,'OPEN','TREND_CONT',"
+            "'2026-08-29 10:00:00','2026-08-29 10:00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        os.remove(self.path)
+
+    def _fetch(self, argv):
+        import sqlite3
+        import view_completed as vc
+        args = vc.parse_args(argv + ["--db", self.path])
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows, label = vc.fetch(conn, args)
+            return rows, label
+        finally:
+            conn.close()
+
+    def test_all_returns_every_closed_trade(self):
+        rows, label = self._fetch(["--all"])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(label, "all time")
+
+    def test_single_date(self):
+        rows, _ = self._fetch(["--date", "2026-08-25"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["symbol"], "SENSEX26AUG81000PE")
+
+    def test_since_until_is_inclusive_both_ends(self):
+        rows, _ = self._fetch(["--since", "2026-08-24", "--until", "2026-08-26"])
+        self.assertEqual(len(rows), 3)
+        rows, _ = self._fetch(["--since", "2026-08-25", "--until", "2026-08-25"])
+        self.assertEqual(len(rows), 1)
+
+    def test_index_filter(self):
+        rows, _ = self._fetch(["--all", "--index", "NIFTY"])
+        self.assertEqual(len(rows), 2)
+
+    def test_exit_reason_filter(self):
+        rows, _ = self._fetch(["--all", "--reason", "TARGET_HIT"])
+        self.assertEqual(len(rows), 2)
+
+    def test_open_flag_shows_only_open(self):
+        rows, _ = self._fetch(["--all", "--open"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "OPEN")
+
+    def test_default_window_is_seven_ist_days(self):
+        import view_completed as vc
+        _, _, label = vc.build_query(vc.parse_args([]))
+        self.assertIn("last 7 day(s)", label)
+        self.assertIn(ist_today(), label)
+
+    def test_newest_first(self):
+        rows, _ = self._fetch(["--all"])
+        stamps = [r["entry_time"] for r in rows]
+        self.assertEqual(stamps, sorted(stamps, reverse=True))
+
+    def test_pnl_uses_stored_qty(self):
+        import view_completed as vc
+        rows, _ = self._fetch(["--date", "2026-08-24"])
+        self.assertAlmostEqual(vc._pnl(rows[0]), (130.0 - 100.0) * 65)
 
 
 if __name__ == "__main__":

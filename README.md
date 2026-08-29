@@ -25,6 +25,7 @@ python3 main.py
 # 3. Scorecard
 python3 scorecard.py
 python3 daily_summary.py
+python3 view_completed.py --days 30      # trade history, any range
 python3 -m unittest test_suite.py -v
 ```
 
@@ -312,6 +313,25 @@ daily entry count against the per-index cap.
 
 Both are populated only for trades opened after the instrumentation landed;
 older rows have no `dte` / `max_favorable_price` and are excluded.
+
+---
+
+## Trade history (`view_completed.py`)
+
+Defaults to the **last 7 IST days**, newest first, with per-trade PnL and a
+per-day breakdown.
+
+```bash
+python3 view_completed.py                    # last 7 days
+python3 view_completed.py --days 30          # last 30 days
+python3 view_completed.py --all              # everything
+python3 view_completed.py --date 2026-08-25  # one day
+python3 view_completed.py --since 2026-08-21 --until 2026-08-28
+```
+
+Filters: `--index NIFTY`, `--reason TARGET_HIT`, `--entry-reason VOLUME_BREAKOUT`,
+`--open` (OPEN rows instead), `--limit N`.
+Output: `--full` (every column), `--csv` (pipe to a file).
 
 ---
 
