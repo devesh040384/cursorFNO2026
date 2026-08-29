@@ -1,3 +1,4 @@
+import io
 import os
 import tempfile
 import unittest
@@ -740,6 +741,41 @@ class TargetConfigTests(unittest.TestCase):
         top = max(float(t["at"]) for t in RISK["trail_tiers"])
         for symbol, cfg in INDICES_CONFIG.items():
             self.assertLess(top, cfg["trending_target_mult"], f"{symbol} top tier >= target")
+
+
+class DocsMatchConfigTests(unittest.TestCase):
+    """Docs that disagree with config are worse than no docs. Pin the numbers
+    a reader would actually act on."""
+
+    @staticmethod
+    def _readme():
+        with io.open("README.md", encoding="utf-8") as f:
+            return f.read()
+
+    def test_readme_documents_current_target_and_stop(self):
+        readme = self._readme()
+        for symbol, cfg in INDICES_CONFIG.items():
+            tgt = int(round((cfg["trending_target_mult"] - 1) * 100))
+            sl = int(round((1 - cfg["trending_sl_mult"]) * 100))
+            self.assertIn(f"+{tgt}%", readme, f"{symbol} target not in README")
+            self.assertIn(f"−{sl}%", readme, f"{symbol} stop not in README")
+
+    def test_readme_documents_every_trail_tier(self):
+        readme = self._readme()
+        for tier in RISK["trail_tiers"]:
+            trigger = f"+{int(round((float(tier['at']) - 1) * 100))}%"
+            self.assertIn(trigger, readme, f"trail tier {trigger} not in README")
+
+    def test_readme_documents_session_and_caps(self):
+        readme = self._readme()
+        for value in (
+            RISK["session_start_hhmm"],
+            RISK["entry_cutoff_hhmm"],
+            RISK["eod_squareoff_hhmm"],
+            RISK["max_daily_entries_per_index"],
+            RISK["paper_max_daily_entries_per_index"],
+        ):
+            self.assertIn(str(value), readme, f"{value} not documented in README")
 
 
 if __name__ == "__main__":
