@@ -26,6 +26,7 @@ python3 main.py
 python3 scorecard.py
 python3 daily_summary.py
 python3 view_completed.py --days 30      # trade history, any range
+python3 preflight_check.py --capital 75000   # readiness gate (exit 1 = blocked)
 python3 -m unittest test_suite.py -v
 ```
 
@@ -309,10 +310,37 @@ daily entry count against the per-index cap.
 |------|---------|
 | `by DTE: DTE0 n=.. INR ..` | Does expiry-day (0-DTE) actually underperform? |
 | `runner capture N% of INR X available` | What share of the gain that was *on the table* did we keep? `max_favorable_price` vs realised. |
+| `execution: slippage INR .. \| avg entry spread ..%` | **The go/no-go metric.** Realised cost of crossing the spread. |
+| `execution drag: N% of net PnL` | How much of the edge execution is eating. |
 | `trades >= INR 1500` | How many trades cleared the runner threshold? |
 
 Both are populated only for trades opened after the instrumentation landed;
 older rows have no `dte` / `max_favorable_price` and are excluded.
+
+---
+
+## Go-live checklist (`preflight_check.py`)
+
+Run before every session; **exit code 1 means do not start.**
+
+```bash
+python3 preflight_check.py --capital 75000     # paper checks
+python3 preflight_check.py --live --capital 75000
+```
+
+| Check | Blocks on |
+|-------|-----------|
+| credentials | any of `SMART_API_KEY`/`SMARTAPI_KEY`, `CLIENT_ID`, `PASSWORD`/`PIN`, `TOTP_SECRET` missing |
+| module imports | any live-path module failing to import |
+| db schema | a required column missing (incl. `dte`, `slippage`, `entry_spread_pct`) |
+| stale open trades | an `OPEN` row from a previous day |
+| scrip master | no usable `scrip_master.json` |
+| risk:reward, trail vs target, session window | internally inconsistent config |
+| capital | daily loss cap > 3% of capital, or peak deployment > capital |
+| alerting *(live only)* | `ALERT_WEBHOOK_URL` unset |
+
+Live mode also **warns** if the daily entry cap is above 2 — the first live week
+should run at 1/day to exercise the order path cheaply.
 
 ---
 

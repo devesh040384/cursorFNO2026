@@ -1016,5 +1016,122 @@ class ViewCompletedTests(unittest.TestCase):
         self.assertAlmostEqual(vc._pnl(rows[0]), (130.0 - 100.0) * 65)
 
 
+class PreflightTests(unittest.TestCase):
+    """The old preflight could never pass: it required TRADING_PIN (nothing reads
+    it) and queried a table named trade_history (the table is `trades`)."""
+
+    def test_credentials_accept_the_names_main_actually_reads(self):
+        import preflight_check as pf
+        saved = {k: os.environ.get(k) for k in
+                 ("SMART_API_KEY", "SMARTAPI_KEY", "CLIENT_ID", "PASSWORD", "PIN", "TOTP_SECRET")}
+        try:
+            for k in saved:
+                os.environ.pop(k, None)
+            os.environ.update({"SMARTAPI_KEY": "k", "CLIENT_ID": "c",
+                               "PIN": "p", "TOTP_SECRET": "t"})
+            rep = pf.Report()
+            pf.check_credentials(rep)
+            self.assertEqual(rep.rows[0][0], pf.PASS, rep.rows[0][2])
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_missing_credentials_fail(self):
+        import preflight_check as pf
+        saved = {k: os.environ.get(k) for k in
+                 ("SMART_API_KEY", "SMARTAPI_KEY", "CLIENT_ID", "PASSWORD", "PIN", "TOTP_SECRET")}
+        try:
+            for k in saved:
+                os.environ.pop(k, None)
+            rep = pf.Report()
+            pf.check_credentials(rep)
+            self.assertEqual(rep.rows[0][0], pf.FAIL)
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_live_path_modules_all_import(self):
+        import preflight_check as pf
+        rep = pf.Report()
+        pf.check_imports(rep)
+        self.assertEqual(rep.rows[0][0], pf.PASS, rep.rows[0][2])
+
+    def test_risk_config_passes_current_settings(self):
+        import preflight_check as pf
+        rep = pf.Report()
+        pf.check_risk_config(rep, capital=75000)
+        self.assertEqual(rep.failures, [], [r[2] for r in rep.failures])
+
+    def test_capital_too_small_is_a_failure(self):
+        import preflight_check as pf
+        rep = pf.Report()
+        # Rs1500/day against Rs10k is 15% -- not survivable.
+        pf.check_risk_config(rep, capital=10000)
+        self.assertTrue(rep.failures)
+
+    def test_report_exit_semantics(self):
+        import preflight_check as pf
+        rep = pf.Report()
+        rep.ok("a")
+        self.assertFalse(rep.failures)
+        rep.warn("b")
+        self.assertFalse(rep.failures)   # warnings do not block
+        rep.fail("c")
+        self.assertTrue(rep.failures)
+
+
+class ExecutionCostReportTests(unittest.TestCase):
+    def test_scorecard_reports_slippage_and_spread(self):
+        import sqlite3
+        from scorecard import load_trades, summarize_closed
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            DatabaseManager(path)
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "INSERT INTO trades (symbol, token, qty, exchange, index_name, entry_price,"
+                " status, exit_price, exit_reason, entry_reason, timestamp, entry_time,"
+                " intended_price, slippage, entry_spread_pct)"
+                " VALUES ('NIFTY26SEP24500CE','1',65,'NFO','NIFTY',101.5,'CLOSED',131.9,"
+                "'TARGET_HIT','VOLUME_BREAKOUT','2026-08-29 10:15:00','2026-08-29 10:15:00',"
+                "100.0,1.5,1.4)"
+            )
+            conn.commit()
+            conn.close()
+            s = summarize_closed(load_trades(DatabaseManager(path)))
+            self.assertEqual(s["slippage_n"], 1)
+            # Slippage is per unit; the cost is per-unit x qty.
+            self.assertAlmostEqual(s["slippage_total"], 1.5 * 65)
+            self.assertAlmostEqual(s["avg_spread_pct"], 1.4)
+        finally:
+            os.remove(path)
+
+    def test_missing_execution_columns_report_none(self):
+        import sqlite3
+        from scorecard import load_trades, summarize_closed
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            DatabaseManager(path)
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "INSERT INTO trades (symbol, token, qty, exchange, index_name, entry_price,"
+                " status, exit_price, exit_reason, entry_reason, timestamp, entry_time)"
+                " VALUES ('NIFTY26AUG24500CE','1',65,'NFO','NIFTY',100.0,'CLOSED',110.0,"
+                "'TARGET_HIT','VOLUME_BREAKOUT','2026-08-29 10:15:00','2026-08-29 10:15:00')"
+            )
+            conn.commit()
+            conn.close()
+            s = summarize_closed(load_trades(DatabaseManager(path)))
+            self.assertEqual(s["slippage_n"], 0)
+            self.assertIsNone(s["slippage_total"])
+        finally:
+            os.remove(path)
+
+
 if __name__ == "__main__":
     unittest.main()

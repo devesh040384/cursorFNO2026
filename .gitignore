@@ -9,3 +9,8 @@ trade_history.db-shm
 trade_history.db-journal
 *.db-wal
 *.db-shm
+
+# Runtime state, regenerated each session
+rsi_state.json
+*.log
+logs/

@@ -79,6 +79,13 @@ def summarize_closed(rows):
     available = 0.0
     runners = 0
     big_wins = 0
+    # Execution cost. Paper fills at LTP; live crosses the spread. The measured
+    # edge is ~2% of notional, so this decides whether the strategy survives live.
+    slip_total = 0.0
+    slip_n = 0
+    spread_sum = 0.0
+    spread_n = 0
+    notional_sum = 0.0
     for row, pnl in zip(rows, pnls):
         keys = row.keys()
         idx = row["index_name"] if "index_name" in keys and row["index_name"] else "UNKNOWN"
@@ -96,6 +103,18 @@ def summarize_closed(rows):
             by_dte[label]["pnl"] += pnl
         if pnl >= 1500.0:
             big_wins += 1
+        qty_row = _qty(row)
+        if row["entry_price"] is not None:
+            notional_sum += float(row["entry_price"]) * qty_row
+        slip = row["slippage"] if "slippage" in keys else None
+        if slip is not None:
+            # Entry slippage is paid per unit; express it in rupees for the trade.
+            slip_total += float(slip) * qty_row
+            slip_n += 1
+        spread = row["entry_spread_pct"] if "entry_spread_pct" in keys else None
+        if spread is not None:
+            spread_sum += float(spread)
+            spread_n += 1
         peak = row["max_favorable_price"] if "max_favorable_price" in keys else None
         entry_p = row["entry_price"] if "entry_price" in keys else None
         qty = _qty(row)
@@ -127,6 +146,11 @@ def summarize_closed(rows):
         "runner_sample": runners,
         "mfe_available": available,
         "big_wins_1500": big_wins,
+        "slippage_total": slip_total if slip_n else None,
+        "slippage_avg": (slip_total / slip_n) if slip_n else None,
+        "slippage_n": slip_n,
+        "avg_spread_pct": (spread_sum / spread_n) if spread_n else None,
+        "avg_notional": (notional_sum / n) if n else 0.0,
     }
 
 
@@ -135,7 +159,8 @@ def load_trades(db_manager):
         """
         SELECT id, symbol, qty, index_name, entry_price, exit_price, status,
                exit_reason, entry_reason, timestamp, entry_time, exit_time,
-               expiry, dte, max_favorable_price
+               expiry, dte, max_favorable_price,
+               intended_price, slippage, entry_spread_pct
         FROM trades
         ORDER BY id ASC
         """
@@ -240,6 +265,22 @@ def format_scorecard(db_manager, show_all=False, since=None):
                 for k, v in sorted(s["by_dte"].items())
             )
             lines.append(f"  by DTE: {dt}")
+        slip_n = s.get("slippage_n") or 0
+        if slip_n:
+            total = s["slippage_total"]
+            gross = sum(abs(p) for p in [s["total_pnl"]]) or 1.0
+            line = (
+                f"  execution: slippage INR {total:.0f} over {slip_n} trade(s) "
+                f"(avg INR {s['slippage_avg']:.2f}/trade)"
+            )
+            if s.get("avg_spread_pct") is not None:
+                line += f" | avg entry spread {s['avg_spread_pct']:.2f}%"
+            lines.append(line)
+            if s["total_pnl"] != 0:
+                lines.append(
+                    f"  execution drag: {100 * total / gross:.0f}% of net PnL "
+                    f"(edge is ~2% of the INR {s['avg_notional']:.0f} avg notional)"
+                )
         rc = s.get("runner_capture")
         if rc is not None:
             lines.append(

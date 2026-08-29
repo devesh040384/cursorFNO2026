@@ -4,6 +4,31 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-08-29 — Sep 15 go-live prep
+
+- **`preflight_check.py` rewritten.** The old one could never pass: it required
+  an env var `TRADING_PIN` that nothing reads, and queried a table
+  `trade_history` when the table is `trades`. It now gates on credentials
+  (using the names `main.py` actually reads), live-path imports, DB schema,
+  stale OPEN rows from a previous day, scrip master, risk/trail/session
+  consistency, capital sizing (`--capital`), and — in live mode —
+  `ALERT_WEBHOOK_URL`. Exit 1 = do not start.
+- **Scorecard now reports execution cost**, which it never did despite the
+  columns existing: `execution: slippage INR .. | avg entry spread ..%` and
+  `execution drag: N% of net PnL`. This is the go/no-go metric — the measured
+  edge is ~2% of notional and a MARKET round trip can exceed that.
+  `load_trades` was also not selecting `slippage` / `entry_spread_pct`, so the
+  data was being written but never read.
+- **Untracked runtime artifacts**: `rsi_state.json` (regenerated every session)
+  and `logs/` + `*.log` (~1.5 MB). Both were dirtying `git status` on every run.
+
+**Still tracked and worth a decision:** `scrip_master.json` +
+`OpenAPIScripMaster.json` are ~68 MB of the repo. They are regenerable from the
+API but `main.py` loads `scrip_master.json` at startup, so untracking them means
+a fresh clone cannot run without a fetch step.
+
+---
+
 ## 2026-08-29 — Trade history viewer
 
 - `view_completed.py` was hardcoded to **today** and used host-local
