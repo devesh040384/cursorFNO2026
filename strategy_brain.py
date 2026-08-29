@@ -370,7 +370,7 @@ class StrategyBrain:
             sl_price = round(opt_ltp * sl_mult, 1)
             logging.info(
                 f"[{symbol}] ENTRY {entry_reason} {option_type} {opt_symbol} qty={qty} @ ₹{opt_ltp} "
-                f"| T ₹{target_price} | SL ₹{sl_price}"
+                f"| T ₹{target_price} | SL ₹{sl_price} | DTE {contract.get('dte')}"
             )
             order_id = self.order_manager.execute_entry(
                 symbol=opt_symbol,
@@ -382,6 +382,8 @@ class StrategyBrain:
                 stop_loss_price=sl_price,
                 index_name=symbol,
                 entry_reason=entry_reason,
+                expiry=contract.get("expiry"),
+                dte=contract.get("dte"),
             )
             return bool(order_id)
         except Exception as e:

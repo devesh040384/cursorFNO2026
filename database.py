@@ -17,6 +17,11 @@ SCHEMA_COLUMNS = {
     "exit_reason": "TEXT",
     "entry_reason": "TEXT",
     "timestamp": "TEXT",
+    # Needed to measure 0-DTE vs next-weekly behaviour after the fact.
+    "expiry": "TEXT",
+    "dte": "INTEGER",
+    # Peak favourable premium while open -> runner capture rate.
+    "max_favorable_price": "REAL",
 }
 
 
@@ -91,6 +96,8 @@ class DatabaseManager:
         exchange=None,
         index_name=None,
         entry_reason=None,
+        expiry=None,
+        dte=None,
     ):
         """Logs a new entry. Returns trade id or None."""
         try:
@@ -101,13 +108,15 @@ class DatabaseManager:
                     INSERT INTO trades (
                         symbol, token, qty, exchange, index_name,
                         entry_price, target_price, stop_loss_price, peak_price,
-                        status, timestamp, entry_time, entry_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        status, timestamp, entry_time, entry_reason,
+                        expiry, dte, max_favorable_price
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         symbol, token, qty, exchange, index_name,
                         entry_price, target_price, stop_loss_price, entry_price,
                         status, now_ist, now_ist, entry_reason,
+                        expiry, dte, entry_price,
                     ),
                 )
                 trade_id = cursor.lastrowid
@@ -125,10 +134,12 @@ class DatabaseManager:
                 cursor.execute(
                     """
                     UPDATE trades
-                    SET stop_loss_price = ?, peak_price = ?
+                    SET stop_loss_price = ?,
+                        peak_price = ?,
+                        max_favorable_price = MAX(COALESCE(max_favorable_price, 0), ?)
                     WHERE id = ? AND status = 'OPEN'
                     """,
-                    (new_sl_price, new_peak_price, trade_id),
+                    (new_sl_price, new_peak_price, new_peak_price, trade_id),
                 )
         except Exception as e:
             logging.error(f"❌ Failed to update TSL for trade {trade_id}: {e}")

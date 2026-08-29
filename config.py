@@ -47,6 +47,11 @@ RISK = {
     # Aug 24: TREND_CONT with only rvol>=1.0 fired into chop; require real expansion.
     "trend_cont_requires_expansion": True,
     "trend_cont_rsi_max": 68.0,
+    # Days-to-expiry floor for the option we buy. 0 = allow expiry-day (0-DTE),
+    # which is what the bot did implicitly. On 0-DTE, theta alone can hit a -10%
+    # stop with no adverse spot move. Set 1 to skip expiry day, 2 to force the
+    # next weekly. Trade-off: higher DTE = lower gamma, so +22% is slower to reach.
+    "min_dte": 0,
     "min_option_volume": 500.0,
     "max_option_spread_pct": 3.0,
 }

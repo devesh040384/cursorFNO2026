@@ -63,6 +63,8 @@ class OrderExecutionEngine:
         index_name=None,
         order_type="MARKET",
         entry_reason=None,
+        expiry=None,
+        dte=None,
     ):
         qty = int(qty)
         if qty <= 0:
@@ -81,7 +83,7 @@ class OrderExecutionEngine:
             trade_id = self.db_manager.log_trade(
                 symbol, token, fill_price, target_price, stop_loss_price,
                 qty=qty, exchange=exchange, index_name=index_name,
-                entry_reason=entry_reason,
+                entry_reason=entry_reason, expiry=expiry, dte=dte,
             )
             logging.info(f"✅ [PAPER] BUY {symbol} @ ₹{fill_price} | db#{trade_id} | {order_id}")
             return order_id
@@ -93,7 +95,7 @@ class OrderExecutionEngine:
         trade_id = self.db_manager.log_trade(
             symbol, token, fill_price, target_price, stop_loss_price,
             qty=qty, exchange=exchange, index_name=index_name,
-            entry_reason=entry_reason,
+            entry_reason=entry_reason, expiry=expiry, dte=dte,
         )
         logging.info(f"✅ [LIVE] BUY {symbol} @ ₹{fill_price} | db#{trade_id} | {order_id}")
         return order_id

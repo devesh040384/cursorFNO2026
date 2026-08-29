@@ -4,6 +4,23 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-08-25 — DTE control + runner-capture instrumentation
+
+- **`min_dte` knob** (default `0` = unchanged). `get_nearest_expiry_contract`
+  used `parsed_date >= today`, so on expiry day the bot bought **0-DTE** ATM
+  options where theta alone can hit the -10% stop with no adverse spot move.
+  Set `1` to skip expiry day, `2` to force the next weekly.
+- Expiry-day comparison now uses **IST**, not host-local `datetime.now()`.
+- Trades record **`expiry`, `dte`** and **`max_favorable_price`** (peak premium
+  while open, mirrored from the existing TSL peak tracking).
+- Scorecard adds **`by DTE`** and **runner capture** — realised gain as a share of
+  the gain that was on the table — plus a count of trades >= INR 1500.
+
+**Why:** neither "does 0-DTE cause the early stop-outs" nor "are runners being
+captured" was answerable from the stored data. Now both are.
+
+---
+
 ## 2026-08-25 — IST correctness, per-index cap, feed-gap safety
 
 - **New `ist_time.py`** — every date/stamp now IST. `database.py`, `scorecard.py`,

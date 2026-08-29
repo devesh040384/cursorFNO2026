@@ -101,7 +101,7 @@ Priority on each **closed 5-min** bar: **VOLUME_BREAKOUT** first, then trend pat
 
 ### Contract selection
 
-- Nearest unexpired ATM CE/PE for the index
+- Nearest ATM CE/PE with **DTE >= `min_dte`** (default 0 = expiry day allowed)
 - Liquidity: min option volume 500; spread ≤ 3% when depth exists (no invented 2% spread)
 - Targets / SL (trending): **+22% / −10%**
 
