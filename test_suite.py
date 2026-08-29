@@ -1133,5 +1133,100 @@ class ExecutionCostReportTests(unittest.TestCase):
             os.remove(path)
 
 
+class TelegramNotifierTests(unittest.TestCase):
+    """Standalone notifier: no network in these tests, and it must never write
+    to the trading DB or alert on routine log noise."""
+
+    def test_urgent_lines_classify_as_urgent(self):
+        import telegram_notifier as tn
+        urgent = [
+            "2026-08-31 11:02:55,113 - CRITICAL - [RECONCILIATION] UNTRACKED broker position X netqty=20",
+            "2026-08-31 11:15:00,000 - CRITICAL - CIRCUIT BREAKER: PnL Rs-1520.00 | streak 1.",
+            "2026-08-31 09:16:03,900 - ERROR - [NIFTY] Implausible spot Rs240.00. Tick dropped.",
+            "2026-08-31 10:00:00,000 - CRITICAL - [LIVE] SELL X order ORD1 is TIMEOUT — not recorded.",
+        ]
+        for line in urgent:
+            label, is_urgent = tn.classify(line)
+            self.assertIsNotNone(label, line)
+            self.assertTrue(is_urgent, line)
+
+    def test_routine_noise_does_not_alert(self):
+        import telegram_notifier as tn
+        for line in [
+            "2026-08-31 12:00:00,000 - INFO - Tick Received - [NIFTY] Spot LTP: Rs24000",
+            "2026-08-31 12:00:00,000 - INFO - [NIFTY 5M VOL] last=1200 rvol=1.10x",
+            "2026-08-31 12:00:00,000 - INFO - [SYSTEM STATUS] all good",
+        ]:
+            self.assertIsNone(tn.classify(line)[0], line)
+
+    def test_entry_and_exit_are_notified_but_not_urgent(self):
+        import telegram_notifier as tn
+        for line in [
+            "2026-08-31 09:47:12,001 - INFO - [NIFTY] ENTRY VOLUME_BREAKOUT CE X qty=65",
+            "2026-08-31 10:31:08,442 - INFO - [TRADE CLOSED] X | Exit Rs131.90 | TARGET_HIT",
+        ]:
+            label, urgent = tn.classify(line)
+            self.assertIsNotNone(label, line)
+            self.assertFalse(urgent, line)
+
+    def test_tail_starts_at_eof_and_survives_rotation(self):
+        import telegram_notifier as tn
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "t.log")
+        try:
+            with io.open(path, "w") as f:
+                f.write("pre-existing backlog\n")
+            tail = tn.LogTail(path)
+            # Must not replay history on startup.
+            self.assertEqual(tail.read_new(), [])
+            with io.open(path, "a") as f:
+                f.write("line A\n")
+            self.assertEqual(tail.read_new(), ["line A"])
+            # RotatingFileHandler renames then recreates.
+            os.rename(path, path + ".1")
+            with io.open(path, "w") as f:
+                f.write("after rotation\n")
+            self.assertEqual(tail.read_new(), ["after rotation"])
+        finally:
+            for f in (path, path + ".1"):
+                if os.path.exists(f):
+                    os.remove(f)
+            os.rmdir(d)
+
+    def test_db_access_is_read_only(self):
+        import sqlite3
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            DatabaseManager(path)
+            conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute("DELETE FROM trades")
+            finally:
+                conn.close()
+        finally:
+            os.remove(path)
+
+    def test_commands_handle_an_empty_database(self):
+        import telegram_notifier as tn
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        saved = tn.DB_FILE
+        try:
+            DatabaseManager(path)
+            tn.DB_FILE = path
+            self.assertIn("No open trades", tn.cmd_open())
+            self.assertIn("No closed trades", tn.cmd_pnl())
+            self.assertIn("No closed trades", tn.cmd_trades())
+        finally:
+            tn.DB_FILE = saved
+            os.remove(path)
+
+    def test_html_escaping(self):
+        import telegram_notifier as tn
+        self.assertEqual(tn.esc("<b>&x</b>"), "&lt;b&gt;&amp;x&lt;/b&gt;")
+
+
 if __name__ == "__main__":
     unittest.main()
