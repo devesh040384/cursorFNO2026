@@ -1,6 +1,8 @@
 import time
 import logging
 
+from broker_orders import confirm_fill
+
 INTRADAY_PRODUCT = "INTRADAY"
 
 
@@ -65,6 +67,9 @@ class OrderExecutionEngine:
         entry_reason=None,
         expiry=None,
         dte=None,
+        bid=None,
+        ask=None,
+        spread_pct=None,
     ):
         qty = int(qty)
         if qty <= 0:
@@ -84,20 +89,54 @@ class OrderExecutionEngine:
                 symbol, token, fill_price, target_price, stop_loss_price,
                 qty=qty, exchange=exchange, index_name=index_name,
                 entry_reason=entry_reason, expiry=expiry, dte=dte,
+                intended_price=price, slippage=0.0,
+                bid=bid, ask=ask, spread_pct=spread_pct,
             )
             logging.info(f"✅ [PAPER] BUY {symbol} @ ₹{fill_price} | db#{trade_id} | {order_id}")
             return order_id
 
+        intended = fill_price
         order_id = self._place_live_order(symbol, token, qty, "BUY", exchange, order_type, fill_price)
         if not order_id:
             return None
-        fill_price = self._fetch_ltp(exchange, symbol, token, fill_price)
+
+        # Never log a position the broker did not actually give us.
+        fill = confirm_fill(self.smart_api, order_id)
+        if not fill.is_filled:
+            if fill.is_dead:
+                logging.error(f"❌ [LIVE] BUY {symbol} {fill.status.upper()} ({order_id}); no position opened.")
+            else:
+                logging.critical(
+                    f"⚠️ [LIVE] BUY {symbol} order {order_id} is {fill.status.upper()} — "
+                    "not recorded. If it fills later you will hold an UNTRACKED position. "
+                    "Check the broker terminal now."
+                )
+            return None
+
+        fill_price = fill.avg_price
+        if fill.filled_qty != qty:
+            logging.warning(
+                f"⚠️ [LIVE] BUY {symbol} partial fill {fill.filled_qty}/{qty}; "
+                "recording the filled quantity."
+            )
+            qty = fill.filled_qty
+        slippage = fill_price - intended
+        # Targets were computed off the intended price; re-derive from the real fill.
+        if intended > 0:
+            target_price = round(target_price / intended * fill_price, 1)
+            stop_loss_price = round(stop_loss_price / intended * fill_price, 1)
+
         trade_id = self.db_manager.log_trade(
             symbol, token, fill_price, target_price, stop_loss_price,
             qty=qty, exchange=exchange, index_name=index_name,
             entry_reason=entry_reason, expiry=expiry, dte=dte,
+            intended_price=intended, slippage=slippage,
+            bid=bid, ask=ask, spread_pct=spread_pct,
         )
-        logging.info(f"✅ [LIVE] BUY {symbol} @ ₹{fill_price} | db#{trade_id} | {order_id}")
+        logging.info(
+            f"✅ [LIVE] BUY {symbol} @ ₹{fill_price} (intended ₹{intended}, "
+            f"slip ₹{slippage:+.2f}) | db#{trade_id} | {order_id}"
+        )
         return order_id
 
     def execute_exit(
@@ -132,13 +171,35 @@ class OrderExecutionEngine:
             logging.info(f"✅ [PAPER] SELL {symbol} @ ₹{fill_price} | closed={closed}")
             return closed
 
+        intended = fill_price
         order_id = self._place_live_order(symbol, token, qty, "SELL", exchange, order_type, fill_price)
         if not order_id:
             logging.error(f"❌ Broker SELL failed for {symbol}; leaving trade #{trade_id} OPEN.")
             return False
-        fill_price = self._fetch_ltp(exchange, symbol, token, fill_price)
+
+        fill = confirm_fill(self.smart_api, order_id)
+        if not fill.is_filled:
+            # Leaving the row OPEN is deliberate: the monitors will retry, and EOD
+            # square-off is the backstop. Booking a close we did not get is worse.
+            logging.critical(
+                f"⚠️ [LIVE] SELL {symbol} order {order_id} is {fill.status.upper()}; "
+                f"trade #{trade_id} left OPEN for retry."
+            )
+            return False
+
+        fill_price = fill.avg_price
+        if fill.filled_qty != qty:
+            logging.critical(
+                f"⚠️ [LIVE] SELL {symbol} partial exit {fill.filled_qty}/{qty}; "
+                f"trade #{trade_id} left OPEN — residual position must be squared manually."
+            )
+            return False
+
         closed = self.db_manager.close_trade(trade_id, fill_price, reason)
-        logging.info(f"✅ [LIVE] SELL {symbol} @ ₹{fill_price} | {order_id} | closed={closed}")
+        logging.info(
+            f"✅ [LIVE] SELL {symbol} @ ₹{fill_price} (intended ₹{intended}, "
+            f"slip ₹{fill_price - intended:+.2f}) | {order_id} | closed={closed}"
+        )
         return closed
 
     def execute_order(self, symbol, token, qty, trans_type="BUY", exchange="NFO",

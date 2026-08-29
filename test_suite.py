@@ -778,5 +778,139 @@ class DocsMatchConfigTests(unittest.TestCase):
             self.assertIn(str(value), readme, f"{value} not documented in README")
 
 
+class OrderBookAPI:
+    """Broker stub whose orderBook() replays a scripted status sequence."""
+
+    def __init__(self, statuses, filled_qty=65, avg_price=101.0, place_ok=True):
+        self.statuses = list(statuses)
+        self.filled_qty = filled_qty
+        self.avg_price = avg_price
+        self.place_ok = place_ok
+        self.placed = []
+
+    def placeOrder(self, params):
+        self.placed.append(params)
+        return "ORD1" if self.place_ok else None
+
+    def orderBook(self):
+        status = self.statuses.pop(0) if self.statuses else "open"
+        return {"status": True, "data": [{
+            "orderid": "ORD1", "orderstatus": status,
+            "filledshares": self.filled_qty if status == "complete" else 0,
+            "averageprice": self.avg_price if status == "complete" else 0,
+        }]}
+
+    def ltpData(self, exchange, symbol, token):
+        return {"status": True, "data": {"ltp": 100.0}}
+
+
+class FillConfirmationTests(unittest.TestCase):
+    def _db(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        return DatabaseManager(path), path
+
+    def test_rejected_order_opens_no_position(self):
+        from broker_orders import confirm_fill
+        api = OrderBookAPI(["rejected"] * 4)
+        self.assertFalse(confirm_fill(api, "ORD1", timeout_sec=0.2, poll_sec=0.05).is_filled)
+        db, path = self._db()
+        try:
+            eng = OrderExecutionEngine(api, db, paper_trading=False)
+            self.assertIsNone(eng.execute_entry(
+                "NIFTY26AUG24500CE", "1", 65, "NFO", 100.0, 130.0, 90.0, index_name="NIFTY"))
+            self.assertEqual(db.count_open_trades(), 0)
+        finally:
+            os.remove(path)
+
+    def test_pending_order_reports_timeout_not_a_fill(self):
+        from broker_orders import confirm_fill
+        # An order that never reaches a terminal state must be UNKNOWN:
+        # not filled (do not open a position) and not dead (it may still execute).
+        api = OrderBookAPI(["open"] * 20)
+        result = confirm_fill(api, "ORD1", timeout_sec=0.2, poll_sec=0.05)
+        self.assertEqual(result.status, "timeout")
+        self.assertFalse(result.is_filled)
+        self.assertFalse(result.is_dead)
+
+    def test_unknown_order_id_is_not_a_fill(self):
+        from broker_orders import confirm_fill
+        api = OrderBookAPI(["complete"])
+        result = confirm_fill(api, "SOME_OTHER_ID", timeout_sec=0.2, poll_sec=0.05)
+        self.assertFalse(result.is_filled)
+
+    def test_fill_uses_broker_price_and_records_slippage(self):
+        db, path = self._db()
+        try:
+            # Intended 100.0, broker fills at 103.0 -> 3.0 slippage.
+            api = OrderBookAPI(["complete"], filled_qty=65, avg_price=103.0)
+            eng = OrderExecutionEngine(api, db, paper_trading=False)
+            self.assertTrue(eng.execute_entry(
+                "NIFTY26AUG24500CE", "1", 65, "NFO", 100.0, 130.0, 90.0, index_name="NIFTY"))
+            row = db.fetch_one(
+                "SELECT entry_price, intended_price, slippage, target_price, stop_loss_price "
+                "FROM trades WHERE status='OPEN'")
+            self.assertAlmostEqual(row["entry_price"], 103.0)
+            self.assertAlmostEqual(row["intended_price"], 100.0)
+            self.assertAlmostEqual(row["slippage"], 3.0)
+            # Targets must be re-derived from the real fill, not the intended price.
+            self.assertAlmostEqual(row["target_price"], 133.9, places=1)
+            self.assertAlmostEqual(row["stop_loss_price"], 92.7, places=1)
+        finally:
+            os.remove(path)
+
+    def test_partial_exit_leaves_trade_open(self):
+        db, path = self._db()
+        try:
+            api = OrderBookAPI(["complete"], filled_qty=65, avg_price=100.0)
+            eng = OrderExecutionEngine(api, db, paper_trading=False)
+            eng.execute_entry("NIFTY26AUG24500CE", "1", 65, "NFO", 100.0, 130.0, 90.0,
+                              index_name="NIFTY")
+            tid = db.fetch_one("SELECT id FROM trades WHERE status='OPEN'")["id"]
+            # Exit fills only 30 of 65 -> must NOT be booked as closed.
+            api.statuses = ["complete"]
+            api.filled_qty = 30
+            self.assertFalse(eng.execute_exit(tid, "NIFTY26AUG24500CE", "1", 65, "NFO",
+                                              110.0, reason="TARGET_HIT"))
+            self.assertEqual(db.count_open_trades(), 1)
+        finally:
+            os.remove(path)
+
+    def test_paper_mode_records_zero_slippage(self):
+        db, path = self._db()
+        try:
+            eng = OrderExecutionEngine(OrderBookAPI([]), db, paper_trading=True)
+            eng.execute_entry("NIFTY26AUG24500CE", "1", 65, "NFO", 120.0, 156.0, 108.0,
+                              index_name="NIFTY", bid=119.0, ask=121.0, spread_pct=1.67)
+            row = db.fetch_one("SELECT slippage, entry_spread_pct FROM trades")
+            self.assertAlmostEqual(row["slippage"], 0.0)
+            self.assertAlmostEqual(row["entry_spread_pct"], 1.67)
+        finally:
+            os.remove(path)
+
+
+class SessionKeeperTests(unittest.TestCase):
+    def test_relogin_only_on_auth_errors(self):
+        from broker_health import SessionKeeper, looks_like_auth_failure
+        self.assertTrue(looks_like_auth_failure("Invalid Token"))
+        self.assertFalse(looks_like_auth_failure("rate limit exceeded"))
+        calls = []
+        keeper = SessionKeeper(lambda: calls.append(1) or f"api{len(calls)}",
+                               min_interval_sec=0)
+        self.assertEqual(keeper.ensure(), "api1")
+        self.assertEqual(keeper.ensure(), "api1")          # cached
+        keeper.handle_error("rate limit exceeded")
+        self.assertEqual(len(calls), 1)                     # no re-login
+        keeper.handle_error("Invalid Token")
+        self.assertEqual(len(calls), 2)                     # re-login
+
+    def test_failed_relogin_keeps_old_handle(self):
+        from broker_health import SessionKeeper
+        keeper = SessionKeeper(lambda: "good", min_interval_sec=0)
+        keeper.ensure()
+        keeper.login_fn = lambda: None
+        self.assertEqual(keeper.handle_error("session expired"), "good")
+
+
 if __name__ == "__main__":
     unittest.main()

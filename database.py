@@ -22,6 +22,14 @@ SCHEMA_COLUMNS = {
     "dte": "INTEGER",
     # Peak favourable premium while open -> runner capture rate.
     "max_favorable_price": "REAL",
+    # Execution quality. Paper fills at LTP with no spread; live crosses it. The
+    # measured edge (~2% of notional) is smaller than one spread crossing, so
+    # these must be recorded to know whether the strategy survives going live.
+    "intended_price": "REAL",
+    "slippage": "REAL",
+    "entry_bid": "REAL",
+    "entry_ask": "REAL",
+    "entry_spread_pct": "REAL",
 }
 
 
@@ -98,6 +106,11 @@ class DatabaseManager:
         entry_reason=None,
         expiry=None,
         dte=None,
+        intended_price=None,
+        slippage=None,
+        bid=None,
+        ask=None,
+        spread_pct=None,
     ):
         """Logs a new entry. Returns trade id or None."""
         try:
@@ -109,14 +122,16 @@ class DatabaseManager:
                         symbol, token, qty, exchange, index_name,
                         entry_price, target_price, stop_loss_price, peak_price,
                         status, timestamp, entry_time, entry_reason,
-                        expiry, dte, max_favorable_price
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        expiry, dte, max_favorable_price,
+                        intended_price, slippage, entry_bid, entry_ask, entry_spread_pct
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         symbol, token, qty, exchange, index_name,
                         entry_price, target_price, stop_loss_price, entry_price,
                         status, now_ist, now_ist, entry_reason,
                         expiry, dte, entry_price,
+                        intended_price, slippage, bid, ask, spread_pct,
                     ),
                 )
                 trade_id = cursor.lastrowid

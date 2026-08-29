@@ -20,20 +20,14 @@ from strategy_brain import StrategyBrain
 from risk_monitors import TrailingStopLossMonitor, TradeReconciler
 from rate_limiter import RateLimitedAPI
 from history_seeder import seed_all
+from broker_health import SessionKeeper, attach_alerting, setup_logging
 from ist_time import ist_hhmm, ist_today
 
 # Disable raw binary frame tracing to prevent terminal flooding
 websocket.enableTrace(False)
 
-# Setup unified logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("trading_bot.log"),
-        logging.StreamHandler()
-    ]
-)
+# Rotating file + console; CRITICAL events also POST to ALERT_WEBHOOK_URL if set.
+setup_logging("trading_bot.log")
 
 load_dotenv()
 
@@ -45,10 +39,11 @@ latest_market_state = {
 
 class SystemHeartbeatMonitor(threading.Thread):
     """Background thread to print system health, spot prices, market regime, and trade counts."""
-    def __init__(self, db_manager, strategy_brain, interval=60):
+    def __init__(self, db_manager, strategy_brain, interval=60, session=None):
         super().__init__()
         self.db_manager = db_manager
         self.strategy_brain = strategy_brain
+        self.session = session
         self.interval = interval
         self.running = True
         self.daemon = True
@@ -101,6 +96,17 @@ class SystemHeartbeatMonitor(threading.Thread):
 
                 from scorecard import heartbeat_line
                 logging.info("💓 [SYSTEM STATUS] " + " || ".join(status_summary) + " || " + heartbeat_line(self.db_manager))
+                # Cheap liveness probe: if the session died, re-auth here rather
+                # than discovering it when an exit needs to fire.
+                if self.session is not None:
+                    try:
+                        probe = self.session.api
+                        if probe is not None:
+                            resp = probe.getProfile(None) if hasattr(probe, "getProfile") else None
+                            if isinstance(resp, dict) and not resp.get("status"):
+                                self.session.handle_error(resp.get("message") or resp)
+                    except Exception as e:
+                        self.session.handle_error(e)
             except Exception as e:
                 logging.error(f"❌ Error in Heartbeat Monitor: {e}")
 
@@ -242,8 +248,12 @@ def load_scrip_master_cache():
 def main():
     logging.info(f"Initializing Multi-Index Framework for: {ACTIVE_INDICES}")
     
+    attach_alerting()
     db_manager = DatabaseManager('trade_history.db')
-    smart_api = authenticate_broker()
+    # SmartAPI tokens expire; an unattended box that loses its session stops
+    # managing OPEN positions silently. The keeper re-logs in on auth errors.
+    session = SessionKeeper(authenticate_broker)
+    smart_api = session.ensure()
     scrip_master = load_scrip_master_cache()
     
     order_engine = OrderExecutionEngine(
@@ -306,9 +316,10 @@ def main():
     logging.info("🛡️ Trailing Stop-Loss Exit Monitor active.")
 
     heartbeat_monitor = SystemHeartbeatMonitor(
-        db_manager=db_manager, 
-        strategy_brain=strategy_brain, 
-        interval=60
+        db_manager=db_manager,
+        strategy_brain=strategy_brain,
+        interval=60,
+        session=session,
     )
     heartbeat_monitor.start()
     logging.info("💓 System Heartbeat Monitor active.")

@@ -192,18 +192,42 @@ class TradeReconciler:
             if not broker_data:
                 broker_data = []
 
-            active_symbols = {
-                p.get("tradingsymbol") for p in broker_data if float(p.get("netqty", 0) or 0) != 0
-            }
+            # No exchange filter: an NFO-only filter silently ignored every
+            # SENSEX/BFO position.
+            live = {}
+            for p in broker_data:
+                try:
+                    netqty = float(p.get("netqty", 0) or 0)
+                except (TypeError, ValueError):
+                    netqty = 0.0
+                if netqty != 0:
+                    live[str(p.get("tradingsymbol") or "")] = p
+            active_symbols = set(live)
 
-            db_trades = self.db.fetch_all("SELECT id, symbol FROM trades WHERE status = 'OPEN'")
+            db_trades = self.db.fetch_all(
+                "SELECT id, symbol FROM trades WHERE status = 'OPEN'"
+            )
+            db_symbols = set()
             for trade in db_trades:
                 trade_id = _row_get(trade, "id", 0)
                 symbol = _row_get(trade, "symbol", 1)
+                db_symbols.add(symbol)
                 if symbol not in active_symbols:
                     logging.warning(
                         f"[RECONCILIATION] {symbol} (ID: {trade_id}) missing at broker; "
                         "leaving OPEN until LTP square-off (will not book ₹0)."
                     )
+
+            # The dangerous direction: the broker holds something we are not
+            # tracking, so no stop, no target and no EOD square-off applies to it.
+            # Usually a crash between placeOrder and the DB write.
+            for symbol, pos in live.items():
+                if symbol in db_symbols:
+                    continue
+                logging.critical(
+                    f"[RECONCILIATION] UNTRACKED broker position {symbol} "
+                    f"netqty={pos.get('netqty')} — no SL/target/EOD applies. "
+                    "Square it off manually or adopt it into the DB."
+                )
         except Exception as e:
             logging.error(f"❌ Error during trade reconciliation: {e}")
