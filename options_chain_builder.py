@@ -181,11 +181,18 @@ class DynamicOptionsChainBuilder:
                     continue
         return 0.0
 
-    def _liquidity_ok(self, q_data, ltp, symbol):
+    def _liquidity_ok(self, q_data, ltp, symbol, out=None):
+        """`out` (a dict) receives the measured bid/ask/spread for the trade row."""
         min_vol = float(RISK.get("min_option_volume", 500.0))
         max_spread = float(RISK.get("max_option_spread_pct", 3.0))
         volume = self._session_volume(q_data)
         bid, ask = self._bid_ask(q_data, ltp)
+        if out is not None:
+            out["bid"] = bid or None
+            out["ask"] = ask or None
+            out["spread_pct"] = (
+                ((ask - bid) / ltp) * 100.0 if (bid and ask and ltp > 0 and ask >= bid) else None
+            )
         if volume < min_vol:
             logging.warning(
                 f"[LIQUIDITY REJECTED] {symbol} (Vol: {volume}, Spread: n/a) — below min volume"
@@ -290,9 +297,11 @@ class DynamicOptionsChainBuilder:
                             return packed
                         continue
                     q_data = self._quote_row(q_resp)
-                    if self._liquidity_ok(q_data, ltp, contract_symbol):
+                    depth = {}
+                    if self._liquidity_ok(q_data, ltp, contract_symbol, out=depth):
                         if packed["lotsize"] <= 0:
                             continue
+                        packed.update(depth)
                         return packed
                 except Exception as ex:
                     logging.warning(f"Could not verify depth for {contract_symbol}: {ex}")

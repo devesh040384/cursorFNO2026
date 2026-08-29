@@ -46,6 +46,8 @@ python3 -m unittest test_suite.py -v
 | `scorecard.py` | PnL / win-rate from stored qty |
 | `history_seeder.py` | Seeds 5-min bar history from broker candles at startup |
 | `ist_time.py` | Single source of IST wall-clock (all dates/stamps) |
+| `broker_orders.py` | Confirms real fills from the order book (never assumes) |
+| `broker_health.py` | Session re-auth, log rotation, CRITICAL alerting |
 | `config.py` | All live knobs |
 
 **Startup seeding**
@@ -121,7 +123,7 @@ Priority on each **closed 5-min** bar: **VOLUME_BREAKOUT** first, then trend pat
   alone can walk a position into the −10% stop with no adverse spot move; set
   `1` to skip expiry day or `2` to force the next weekly. Trade-off: higher DTE
   means lower gamma, so **+30% is slower to reach**.
-- Liquidity: min option volume 500; spread ≤ 3% when depth exists (no invented 2% spread)
+- Liquidity: min option volume 500; spread ≤ **1.5%** when depth exists (no invented 2% spread)
 - Targets / SL (trending): **+30% / −10%** (3:1)
 - `expiry`, `dte` and `max_favorable_price` are stored on every trade so the DTE
   question can be answered from data instead of assumption
@@ -233,7 +235,7 @@ min_dte                           = 0       # 1 skips expiry day, 2 = next weekl
 min_option_premium                = 25.0
 max_premium_risk_inr              = 8000.0
 min_option_volume                 = 500.0
-max_option_spread_pct             = 3.0
+max_option_spread_pct             = 1.5     # was 3.0; see Execution below
 
 # --- exits -------------------------------------------------------------
 trending_target_mult              = 1.30    # per index, +30%
@@ -249,6 +251,44 @@ ACTIVE_INDICES                    = NIFTY, SENSEX
 SCORECARD_SINCE                   = 2026-08-21
 enable_choppy_entries             = False
 ```
+
+---
+
+## Execution (live mode)
+
+Paper mode fills instantly at LTP. **Live crosses the bid-ask, and that cost is
+the same order of magnitude as the entire measured edge:**
+
+| Spread | MARKET round trip | vs measured edge (₹98.78/trade = 2.09% of notional) |
+|--------|-------------------|------------------------------------------------|
+| 1% | ~₹94 | **1.0×** |
+| 2% | ~₹189 | **1.9×** |
+| 3% | ~₹283 | **2.9×** |
+
+Hence `max_option_spread_pct = 1.5`, and every trade now records `entry_bid`,
+`entry_ask`, `entry_spread_pct`, `intended_price` and `slippage` so realised
+execution cost is measurable rather than assumed.
+
+**Fills are confirmed, never assumed.** After `placeOrder`, `broker_orders.confirm_fill`
+polls the order book until the order is terminal:
+
+| Outcome | Behaviour |
+|---------|-----------|
+| `complete` | Trade logged at the **broker's** average price; target/SL re-derived from the real fill |
+| `rejected` / `cancelled` | **No position recorded** |
+| Still pending at timeout | Treated as **UNKNOWN** — not logged, `CRITICAL` raised. May still fill, so check the broker terminal |
+| Partial entry | Records the filled quantity only |
+| Partial exit | Trade left **OPEN**; residual must be squared manually |
+
+Reconciliation also reports **untracked broker positions** (held at broker, absent
+from the DB — typically a crash between `placeOrder` and the DB write). Those carry
+no SL, target or EOD square-off, so they raise `CRITICAL`.
+
+**Session:** SmartAPI tokens expire. `SessionKeeper` re-authenticates on auth
+errors only (not on rate limits), probed each heartbeat.
+
+**Alerting:** set `ALERT_WEBHOOK_URL` in `.env` to POST `CRITICAL` events
+(rate-limited to one per 30s). Unset = log only. Logs rotate at 10MB × 5.
 
 ---
 

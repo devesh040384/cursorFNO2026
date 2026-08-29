@@ -4,6 +4,41 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-08-29 — Execution hardening (pre-live)
+
+Everything here targets the gap between paper and live. Paper fills instantly at
+LTP and never rejects; none of the live order path had ever run.
+
+- **Fills are confirmed, not assumed.** New `broker_orders.confirm_fill` polls the
+  order book until terminal. Previously `execute_entry` placed an order and
+  immediately logged a fill at LTP — a **rejected order became a phantom open
+  position** that the TSL monitor would then try to sell. Nothing read the order
+  book anywhere in the codebase.
+  - rejected/cancelled → no position recorded
+  - pending at timeout → UNKNOWN, not logged, `CRITICAL` (it may still fill)
+  - partial entry → records filled qty; partial exit → leaves the trade OPEN
+  - trades log the **broker's** average price, and target/SL are re-derived from
+    the real fill instead of the intended price
+- **`max_option_spread_pct` 3.0 → 1.5.** Measured edge is 2.09% of notional; a
+  MARKET round trip at 3% spread costs ~2.9× that. This was the single largest
+  threat to going live.
+- **Execution quality recorded**: `intended_price`, `slippage`, `entry_bid`,
+  `entry_ask`, `entry_spread_pct` on every trade.
+- **`broker_health.SessionKeeper`** re-authenticates on auth errors only (not
+  rate limits), probed each heartbeat. `generateSession` previously ran once at
+  startup, so an expired token silently stopped all position management.
+- **Reconciliation reports untracked broker positions** (at broker, absent from
+  DB — a crash between `placeOrder` and the DB write). These carry no SL, target
+  or EOD square-off. The old exchange filter also ignored every SENSEX/BFO row.
+- **Rotating logs** (10MB × 5; was an unbounded `FileHandler`) and optional
+  `CRITICAL` webhook alerting via `ALERT_WEBHOOK_URL`.
+
+**Why now:** go-live is Sep 15 with ~10 sessions left. The paper edge is not yet
+statistically significant (t = 1.32, needs ~90 trades), so these changes make
+failure *visible and bounded* rather than proving the strategy works.
+
+---
+
 ## 2026-08-25 — Target +30%, tiered trail ladder
 
 - `trending_target_mult` **1.22 -> 1.30** (both indices). With the -10% stop that
@@ -188,7 +223,7 @@ expansion windows sit inside it.
 | Entries | VOLUME_BREAKOUT → TREND_CONT / RSI_HOOK |
 | Choppy extreme RSI | OFF |
 | Volume gate | Futures RVOL, sticky hold, tick dedupe, partial/gap bars discarded |
-| Liquidity | Volume + real depth spread (no fake 2%) |
+| Liquidity | Volume + real depth spread, cap **1.5%** (no fake 2%) |
 | Contract | ATM, `min_dte = 0` (0-DTE allowed); expiry/DTE recorded per trade |
 | Target / SL | **+30% / −10%** (3:1) |
 | Trail | 5-tier ladder: +4% BE, +8% ×1.02, +15% 50% peak, +22% 65%, +26% 75% |
@@ -196,7 +231,9 @@ expansion windows sit inside it.
 | Session | 09:45–14:30 entries; 15:15 EOD |
 | Timezone | All wall-clock via `ist_time.py` (host-local never used) |
 | Scorecard | From 2026-08-21; adds `by DTE` + runner capture |
-| Tests | 37 in `test_suite.py` |
+| Execution | Fills confirmed via order book; slippage + spread recorded |
+| Session | Auto re-auth on token expiry; rotating logs; optional webhook alerts |
+| Tests | 48 in `test_suite.py` |
 
 ---
 

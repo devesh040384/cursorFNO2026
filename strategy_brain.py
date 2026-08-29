@@ -366,11 +366,13 @@ class StrategyBrain:
             ):
                 return False
 
+            spread = contract.get("spread_pct")
+            spread_s = f"{spread:.2f}%" if spread is not None else "n/a"
             target_price = round(opt_ltp * target_mult, 1)
             sl_price = round(opt_ltp * sl_mult, 1)
             logging.info(
                 f"[{symbol}] ENTRY {entry_reason} {option_type} {opt_symbol} qty={qty} @ ₹{opt_ltp} "
-                f"| T ₹{target_price} | SL ₹{sl_price} | DTE {contract.get('dte')}"
+                f"| T ₹{target_price} | SL ₹{sl_price} | DTE {contract.get('dte')} | spread {spread_s}"
             )
             order_id = self.order_manager.execute_entry(
                 symbol=opt_symbol,
@@ -384,6 +386,9 @@ class StrategyBrain:
                 entry_reason=entry_reason,
                 expiry=contract.get("expiry"),
                 dte=contract.get("dte"),
+                bid=contract.get("bid"),
+                ask=contract.get("ask"),
+                spread_pct=contract.get("spread_pct"),
             )
             return bool(order_id)
         except Exception as e:

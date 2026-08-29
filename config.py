@@ -70,7 +70,11 @@ RISK = {
     # next weekly. Trade-off: higher DTE = lower gamma, so +22% is slower to reach.
     "min_dte": 0,
     "min_option_volume": 500.0,
-    "max_option_spread_pct": 3.0,
+    # Measured paper edge is ~2.1% of notional. A MARKET round trip pays the
+    # spread twice, so a 3% cap let execution cost reach ~2.9x the entire edge.
+    # 1.5% caps round-trip cost near the edge instead of multiples of it.
+    # Raising this back toward 3.0 will increase trade count and destroy expectancy.
+    "max_option_spread_pct": 1.5,
 }
 
 
