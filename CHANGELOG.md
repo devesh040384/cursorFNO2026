@@ -4,6 +4,56 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-08-25 — Target +30%, tiered trail ladder
+
+- `trending_target_mult` **1.22 -> 1.30** (both indices). With the -10% stop that
+  is **3:1** R:R.
+- Trailing SL is now a config-driven ladder (`RISK["trail_tiers"]`), replacing the
+  hardcoded if/elif chain:
+
+  | Trigger | Lock |
+  |---------|------|
+  | +4% | breakeven *(unchanged)* |
+  | +8% | entry x 1.02 *(unchanged)* |
+  | +15% | 50% of peak gain *(unchanged)* |
+  | +22% | **65% of peak gain** *(new)* |
+  | +26% | **75% of peak gain** *(new)* |
+
+- Behaviour below +15% is **byte-identical** to before. A trade peaking at +30%
+  now locks **+22.5%** instead of +15% — ~+35% more kept across give-back
+  scenarios.
+
+**Why:** on last week's 39 trades, the +4%/+8% tiers turned 9 would-be -10%
+losers into +2.8% average wins. Loosening them needed **40%** of those trades to
+run to +22% just to break even, with a worst case of **-Rs5,453** — enough to
+flip the week negative on its own. Raising the target is the far safer bet: a
+miss still exits as a *win* on the trail. Break-even continuation is **53%** at
++30% but **77%** at +25%, so +25% is strictly worse than +30% — it gains too
+little per hit to pay for the misses. The upper tiers only touch trades already
+deep in profit, so they cannot convert a winner into a loser.
+
+**Not changed:** `time_stop_minutes` stays 25. A +30% target needs more time than
++22%, so this is the most likely follow-up knob once DTE/runner data lands.
+
+---
+
+## 2026-08-25 — DTE control + runner-capture instrumentation
+
+- **`min_dte` knob** (default `0` = unchanged). `get_nearest_expiry_contract`
+  used `parsed_date >= today`, so on expiry day the bot bought **0-DTE** ATM
+  options where theta alone can hit the -10% stop with no adverse spot move.
+  Set `1` to skip expiry day, `2` to force the next weekly.
+- Expiry-day comparison now uses **IST**, not host-local `datetime.now()`.
+- Trades record **`expiry`, `dte`** and **`max_favorable_price`** (peak premium
+  while open, mirrored from the existing TSL peak tracking).
+- Scorecard adds **`by DTE`** and **runner capture** — realised gain as a share of
+  the gain that was on the table — plus a count of trades >= INR 1500.
+
+**Why:** neither "does 0-DTE cause the early stop-outs" nor "are runners being
+captured" was answerable from the stored data. Now both are.
+
+---
+
 ## 2026-08-25 — IST correctness, per-index cap, feed-gap safety
 
 - **New `ist_time.py`** — every date/stamp now IST. `database.py`, `scorecard.py`,

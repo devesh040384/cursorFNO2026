@@ -32,6 +32,23 @@ RISK = {
     "max_premium_risk_inr": 8000.0,
     "time_stop_minutes": 25,
     "time_stop_min_gain_mult": 1.02,
+    # Trailing ladder, applied in order; a tier only ever RAISES the stop.
+    #   entry : SL = entry price (breakeven)
+    #   mult  : SL = entry * value
+    #   peak  : SL = entry + value * (peak - entry)   -> keeps `value` of peak gain
+    # The first two tiers are deliberately unchanged: they convert would-be -10%
+    # losers into small wins, and loosening them is the single riskiest change
+    # available (see CHANGELOG 2026-08-25 target/trail note).
+    # The upper tiers are new — they only touch trades already deep in profit, so
+    # they cannot turn a winner into a loser, and they are what actually raises
+    # runner capture as the target moves out to +30%.
+    "trail_tiers": [
+        {"at": 1.04, "mode": "entry", "value": 0.0},
+        {"at": 1.08, "mode": "mult", "value": 1.02},
+        {"at": 1.15, "mode": "peak", "value": 0.50},
+        {"at": 1.22, "mode": "peak", "value": 0.65},
+        {"at": 1.26, "mode": "peak", "value": 0.75},
+    ],
     # Hybrid: 5-min closed bars for regime/entries/RVOL; exits stay tick/1-min monitors.
     "signal_bar_sec": 300,
     "breakout_max_age_sec": 600,
@@ -47,6 +64,11 @@ RISK = {
     # Aug 24: TREND_CONT with only rvol>=1.0 fired into chop; require real expansion.
     "trend_cont_requires_expansion": True,
     "trend_cont_rsi_max": 68.0,
+    # Days-to-expiry floor for the option we buy. 0 = allow expiry-day (0-DTE),
+    # which is what the bot did implicitly. On 0-DTE, theta alone can hit a -10%
+    # stop with no adverse spot move. Set 1 to skip expiry day, 2 to force the
+    # next weekly. Trade-off: higher DTE = lower gamma, so +22% is slower to reach.
+    "min_dte": 0,
     "min_option_volume": 500.0,
     "max_option_spread_pct": 3.0,
 }
@@ -106,9 +128,10 @@ INDICES_CONFIG = {
         "vwap_buffer": 2.0,
         "ema_spread_min": 1.0,
         "regime_mean_bars": 20,
-        # Tighter than original 15%/50%: smaller loss, realistic option target
+        # 10% stop against a 30% target = 3:1. Raised from 22% because a miss now
+        # exits on the 65-75%-of-peak trail (still a win), not at breakeven.
         "trending_sl_mult": 0.90,       # 10% stop
-        "trending_target_mult": 1.22,   # 22% target
+        "trending_target_mult": 1.30,   # 30% target
         "choppy_sl_mult": 0.95,
         "choppy_target_mult": 1.08,
     },
@@ -125,7 +148,7 @@ INDICES_CONFIG = {
         "ema_spread_min": 6.0,
         "regime_mean_bars": 20,
         "trending_sl_mult": 0.90,
-        "trending_target_mult": 1.22,
+        "trending_target_mult": 1.30,
         "choppy_sl_mult": 0.95,
         "choppy_target_mult": 1.08,
     }

@@ -73,6 +73,12 @@ def summarize_closed(rows):
     by_index = defaultdict(lambda: {"n": 0, "pnl": 0.0})
     by_reason = defaultdict(lambda: {"n": 0, "pnl": 0.0})
     by_entry = defaultdict(lambda: {"n": 0, "pnl": 0.0})
+    by_dte = defaultdict(lambda: {"n": 0, "pnl": 0.0})
+    # Runner capture: realised gain vs the best gain that was available while open.
+    captured = 0.0
+    available = 0.0
+    runners = 0
+    big_wins = 0
     for row, pnl in zip(rows, pnls):
         keys = row.keys()
         idx = row["index_name"] if "index_name" in keys and row["index_name"] else "UNKNOWN"
@@ -84,6 +90,21 @@ def summarize_closed(rows):
         if "entry_reason" in keys and row["entry_reason"]:
             by_entry[row["entry_reason"]]["n"] += 1
             by_entry[row["entry_reason"]]["pnl"] += pnl
+        if "dte" in keys and row["dte"] is not None:
+            label = f"DTE{int(row['dte'])}"
+            by_dte[label]["n"] += 1
+            by_dte[label]["pnl"] += pnl
+        if pnl >= 1500.0:
+            big_wins += 1
+        peak = row["max_favorable_price"] if "max_favorable_price" in keys else None
+        entry_p = row["entry_price"] if "entry_price" in keys else None
+        qty = _qty(row)
+        if peak is not None and entry_p is not None and qty:
+            best = (float(peak) - float(entry_p)) * qty
+            if best > 0:
+                available += best
+                captured += max(pnl, 0.0)
+                runners += 1
 
     return {
         "trades": n,
@@ -100,6 +121,12 @@ def summarize_closed(rows):
         "by_index": dict(by_index),
         "by_reason": dict(by_reason),
         "by_entry": dict(by_entry),
+        "by_dte": dict(by_dte),
+        # Fraction of the gain that was actually on the table that we kept.
+        "runner_capture": (captured / available) if available > 0 else None,
+        "runner_sample": runners,
+        "mfe_available": available,
+        "big_wins_1500": big_wins,
     }
 
 
@@ -107,7 +134,8 @@ def load_trades(db_manager):
     return db_manager.fetch_all(
         """
         SELECT id, symbol, qty, index_name, entry_price, exit_price, status,
-               exit_reason, entry_reason, timestamp, entry_time, exit_time
+               exit_reason, entry_reason, timestamp, entry_time, exit_time,
+               expiry, dte, max_favorable_price
         FROM trades
         ORDER BY id ASC
         """
@@ -206,6 +234,18 @@ def format_scorecard(db_manager, show_all=False, since=None):
         if s.get("by_entry"):
             er = ", ".join(f"{k} n={v['n']} INR {v['pnl']:.0f}" for k, v in sorted(s["by_entry"].items()))
             lines.append(f"  by entry: {er}")
+        if s.get("by_dte"):
+            dt = ", ".join(
+                f"{k} n={v['n']} INR {v['pnl']:.0f}"
+                for k, v in sorted(s["by_dte"].items())
+            )
+            lines.append(f"  by DTE: {dt}")
+        rc = s.get("runner_capture")
+        if rc is not None:
+            lines.append(
+                f"  runner capture {100 * rc:.0f}% of INR {s['mfe_available']:.0f} available "
+                f"(n={s['runner_sample']}) | trades >= INR 1500: {s['big_wins_1500']}"
+            )
     lines.append(f"\nOPEN now: {len(parts['open'])} (unrealized skipped; no LTP fetch)")
     lines.append("=" * 64)
     return "\n".join(lines)

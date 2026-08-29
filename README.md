@@ -101,9 +101,9 @@ Priority on each **closed 5-min** bar: **VOLUME_BREAKOUT** first, then trend pat
 
 ### Contract selection
 
-- Nearest unexpired ATM CE/PE for the index
+- Nearest ATM CE/PE with **DTE >= `min_dte`** (default 0 = expiry day allowed)
 - Liquidity: min option volume 500; spread ≤ 3% when depth exists (no invented 2% spread)
-- Targets / SL (trending): **+22% / −10%**
+- Targets / SL (trending): **+30% / −10%** (3:1)
 
 After a fill: **15-min** per-index cooldown.
 
@@ -150,7 +150,8 @@ cap, trend soft-cap, max open per index / total, premium floor, notional ceiling
 ### Exits
 
 1. **TARGET_HIT** / **STOP_LOSS_HIT**  
-2. **Trailing:** +4% → SL to entry; +8% → entry×1.02; +15% → lock 50% of peak gain  
+2. **Trailing ladder** (`RISK["trail_tiers"]`, each tier only ever raises the stop):
+   +4% → breakeven | +8% → entry×1.02 | +15% → 50% of peak | +22% → 65% of peak | +26% → 75% of peak  
 3. **TIME_STOP** (25 min, gain &lt; 2%)  
 4. **EOD_SQUAREOFF** (15:15) — refuses exit if LTP missing / ₹0  
 

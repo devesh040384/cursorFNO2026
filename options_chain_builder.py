@@ -1,8 +1,9 @@
 import logging
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import FALLBACK_LOT_SIZE, RISK
+from ist_time import ist_now
 
 
 class DynamicOptionsChainBuilder:
@@ -33,12 +34,17 @@ class DynamicOptionsChainBuilder:
         except (TypeError, ValueError):
             return int(FALLBACK_LOT_SIZE.get(self.index_name, 0))
 
+    @staticmethod
+    def _ist_midnight():
+        return ist_now().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+
     def _pack(self, candidate, expiry_date):
         return {
             "symbol": candidate.get("symbol"),
             "token": candidate.get("token") or candidate.get("symboltoken"),
             "strike": candidate.get("parsed_strike"),
             "expiry": expiry_date.strftime("%d%b%Y").upper(),
+            "dte": (expiry_date - self._ist_midnight()).days,
             "lotsize": self._lotsize(candidate),
             "exchange": self.option_exchange,
         }
@@ -86,7 +92,7 @@ class DynamicOptionsChainBuilder:
                 with open("scrip_master.json", "r", encoding="utf-8") as f:
                     source = json.load(f)
                     self.scrip_master_data = source
-            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            today = self._ist_midnight()
             candidates = []
             for item in source:
                 if str(item.get("instrumenttype") or "").upper() != "FUTIDX":
@@ -212,18 +218,23 @@ class DynamicOptionsChainBuilder:
                     return None
 
             valid_contracts = []
-            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            today = self._ist_midnight()
+            min_dte = int(RISK.get("min_dte", 0))
+            cutoff = today + timedelta(days=min_dte)
 
             for c in self.nfo_contracts:
                 exp_str = c.get("expiry")
                 if not exp_str:
                     continue
                 parsed_date = self._parse_expiry(exp_str)
-                if parsed_date and parsed_date >= today:
+                if parsed_date and parsed_date >= cutoff:
                     c["parsed_expiry_date"] = parsed_date
                     valid_contracts.append(c)
 
             if not valid_contracts:
+                logging.warning(
+                    f"[{self.index_name}] No contract with DTE >= {min_dte}."
+                )
                 return None
 
             earliest_expiry_date = min(valid_contracts, key=lambda x: x["parsed_expiry_date"])["parsed_expiry_date"]
