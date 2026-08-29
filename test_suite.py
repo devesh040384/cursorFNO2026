@@ -683,5 +683,64 @@ class ISTTimeTests(unittest.TestCase):
             os.remove(path)
 
 
+class TrailLadderTests(unittest.TestCase):
+    """The ladder must never turn a winner into a loser, which is the whole
+    reason the two lowest tiers were left at +4% / +8%."""
+
+    def setUp(self):
+        from risk_monitors import _trailed_stop
+        self.f = _trailed_stop
+        self.E = 100.0
+        self.INIT_SL = 90.0
+
+    def test_low_tiers_unchanged_from_previous_behaviour(self):
+        # Below +4% nothing moves; the -10% stop stands.
+        self.assertEqual(self.f(self.E, 103.0, 103.0, self.INIT_SL), self.INIT_SL)
+        # +4% -> breakeven, +8% -> entry * 1.02, exactly as before.
+        self.assertAlmostEqual(self.f(self.E, 104.0, 104.0, self.INIT_SL), 100.0)
+        self.assertAlmostEqual(self.f(self.E, 108.0, 108.0, self.INIT_SL), 102.0)
+
+    def test_high_tiers_capture_more_of_the_peak(self):
+        # Old rule locked a flat 50% of peak gain all the way up.
+        old_at_30 = self.E + 0.50 * (130.0 - self.E)
+        new_at_30 = self.f(self.E, 130.0, 130.0, self.INIT_SL)
+        self.assertGreater(new_at_30, old_at_30)
+        self.assertAlmostEqual(new_at_30, 122.5)  # 75% of a +30% peak
+
+    def test_never_lowers_an_existing_stop(self):
+        self.assertEqual(self.f(self.E, 130.0, 130.0, 125.0), 125.0)
+
+    def test_monotonic_in_peak(self):
+        prev = 0.0
+        for peak in range(100, 145):
+            sl = self.f(self.E, float(peak), float(peak), self.INIT_SL)
+            self.assertGreaterEqual(sl, prev)
+            prev = sl
+
+    def test_tier_jump_between_polls_takes_the_best_lock(self):
+        # A gap-up straight from entry to +30% must not stop at the +4% tier.
+        self.assertAlmostEqual(self.f(self.E, 130.0, 130.0, self.INIT_SL), 122.5)
+
+    def test_locked_gain_never_exceeds_the_peak(self):
+        for peak in range(101, 160):
+            self.assertLess(self.f(self.E, float(peak), float(peak), self.INIT_SL), float(peak))
+
+
+class TargetConfigTests(unittest.TestCase):
+    def test_target_and_stop_give_at_least_3to1(self):
+        for symbol, cfg in INDICES_CONFIG.items():
+            reward = cfg["trending_target_mult"] - 1.0
+            risk = 1.0 - cfg["trending_sl_mult"]
+            self.assertGreaterEqual(reward / risk, 3.0, f"{symbol} R:R below 3:1")
+
+    def test_top_trail_tier_sits_below_the_target(self):
+        # If the last tier triggered at or above the target the target would
+        # always fire first and the tier would be dead code.
+        from config import RISK
+        top = max(float(t["at"]) for t in RISK["trail_tiers"])
+        for symbol, cfg in INDICES_CONFIG.items():
+            self.assertLess(top, cfg["trending_target_mult"], f"{symbol} top tier >= target")
+
+
 if __name__ == "__main__":
     unittest.main()

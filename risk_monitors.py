@@ -35,6 +35,42 @@ def _qty_and_exchange(row):
     return int(qty), exchange
 
 
+DEFAULT_TRAIL_TIERS = [
+    {"at": 1.04, "mode": "entry", "value": 0.0},
+    {"at": 1.08, "mode": "mult", "value": 1.02},
+    {"at": 1.15, "mode": "peak", "value": 0.50},
+]
+
+
+def _trail_tiers():
+    tiers = RISK.get("trail_tiers") or DEFAULT_TRAIL_TIERS
+    return sorted(tiers, key=lambda t: float(t["at"]))
+
+
+def _trailed_stop(entry_price, peak_price, current_price, current_sl):
+    """Highest stop justified by the ladder. Never lowers an existing stop.
+
+    Tiers are evaluated cheapest-first and the best qualifying one wins, so a
+    trade that jumps several tiers between polls still gets the top lock.
+    """
+    best = float(current_sl or 0.0)
+    for tier in _trail_tiers():
+        if current_price < entry_price * float(tier["at"]):
+            continue
+        mode = str(tier.get("mode", "entry")).lower()
+        value = float(tier.get("value", 0.0))
+        if mode == "entry":
+            candidate = entry_price
+        elif mode == "mult":
+            candidate = entry_price * value
+        elif mode == "peak":
+            candidate = entry_price + value * (peak_price - entry_price)
+        else:
+            continue
+        best = max(best, candidate)
+    return best
+
+
 class TrailingStopLossMonitor(threading.Thread):
     def __init__(self, db_manager, smart_api=None, order_engine=None, interval=5):
         super().__init__()
@@ -100,16 +136,10 @@ class TrailingStopLossMonitor(threading.Thread):
                     self.close_trade(trade_id, symbol, token, qty, exchange, current_price, "TIME_STOP")
                     continue
 
-                if current_price > peak_price or current_price >= entry_price * 1.04:
+                first_tier = _trail_tiers()[0]["at"] if _trail_tiers() else 1.04
+                if current_price > peak_price or current_price >= entry_price * first_tier:
                     new_peak = max(peak_price, current_price)
-                    new_sl = sl_price
-                    if current_price >= entry_price * 1.15:
-                        locked = entry_price + 0.50 * (new_peak - entry_price)
-                        new_sl = max(sl_price, locked)
-                    elif current_price >= entry_price * 1.08:
-                        new_sl = max(sl_price, entry_price * 1.02)
-                    elif current_price >= entry_price * 1.04:
-                        new_sl = max(sl_price, entry_price)
+                    new_sl = _trailed_stop(entry_price, new_peak, current_price, sl_price)
                     self.db.update_trailing_stoploss(trade_id, new_sl, new_peak)
         except Exception as e:
             logging.error(f"❌ Failed checking/updating stop losses: {e}")
