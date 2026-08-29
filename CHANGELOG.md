@@ -4,6 +4,20 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-08-29 — Trade history viewer
+
+- `view_completed.py` was hardcoded to **today** and used host-local
+  `datetime.now()`, so on the UTC EC2 box it showed the wrong day. It also did
+  `SELECT *`, which now dumps 20+ columns unreadably.
+- Rewritten with date ranges (`--days` / `--all` / `--date` / `--since`+`--until`,
+  default last 7 IST days), filters (`--index`, `--reason`, `--entry-reason`,
+  `--open`, `--limit`), and output modes (`--full`, `--csv`).
+- Shows per-trade PnL, a win/loss summary and a per-day breakdown.
+- Feed-gap logs now report an implausible bar count as "clock reset / long
+  outage" instead of e.g. "5960011 bar(s) missed", which reads as corruption.
+
+---
+
 ## 2026-08-29 — Execution hardening (pre-live)
 
 Everything here targets the gap between paper and live. Paper fills instantly at

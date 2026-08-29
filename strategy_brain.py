@@ -10,6 +10,8 @@ from indicators import wilder_rsi, volume_expanded
 # Upper bound on the entry pause after a feed gap: EMA21 needs ~21 clean bars,
 # but pausing longer than that just wastes the session.
 MAX_STALE_BARS = 22
+# Beyond one trading day of bars the count is not a "gap", it is a stale clock.
+MAX_SANE_GAP_BARS = 75
 
 
 class VolumeExpansionGate:
@@ -218,8 +220,15 @@ class VolumeExpansionGate:
             # stale sticky state and let RVOL rebuild from clean bars instead.
             missed = int((now - self.last_bar_time[symbol]) // bar_sec) - 1
             if missed > 0:
+                # A stale or never-set clock yields an absurd count; report it as a
+                # reset rather than "5960011 bars missed", which reads as corruption.
+                gap = (
+                    f"{missed} bar(s) missed"
+                    if missed <= MAX_SANE_GAP_BARS
+                    else "clock reset / long outage"
+                )
                 logging.warning(
-                    f"[{symbol}] Futures volume feed gap: {missed} bar(s) missed. "
+                    f"[{symbol}] Futures volume feed gap: {gap}. "
                     "Dropping partial bar and clearing sticky expansion."
                 )
                 self.volume_ok[symbol] = False
@@ -536,8 +545,13 @@ class StrategyBrain:
                 self.stale_bars[symbol] = min(
                     MAX_STALE_BARS, self.stale_bars.get(symbol, 0) + missed
                 )
+                gap = (
+                    f"{missed} bar(s) missed"
+                    if missed <= MAX_SANE_GAP_BARS
+                    else "clock reset / long outage"
+                )
                 logging.warning(
-                    f"[{symbol}] Signal bar gap: {missed} bar(s) missed. "
+                    f"[{symbol}] Signal bar gap: {gap}. "
                     f"Entries paused for {self.stale_bars[symbol]} clean bar(s)."
                 )
             if history:
