@@ -4,6 +4,29 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-01 — Backtest harness
+
+- `backtest_engine.py` replays the **live** `StrategyBrain` and the real
+  `_trailed_stop` over cached candles. Nothing is reimplemented, so the backtest
+  cannot drift from the bot.
+- `backtest_options.py`: Black-Scholes ATM pricing (delta, gamma **and** theta,
+  which is what the 0-DTE question needs), `implied_iv`, per-index IV
+  calibration from real fills, and an Angel One round-trip cost model.
+- `backtest_data.py`: chunked candle fetch with a CSV cache, so the slow pull
+  happens once and sweeps read from disk.
+- Clock substitution is reverted on exit and covered by a test — a leaked patch
+  would corrupt the live modules in the same process.
+
+**Calibration finding:** NIFTY and SENSEX do not trade at the same IV. Backed out
+of the Aug 31 fills, NIFTY sits near 13% and SENSEX near 8%; the 14% default
+over-priced SENSEX by 71%. Per-index IV is required, not optional.
+
+**Cost finding:** ~Rs60 per round trip, and brokerage is flat, so it is ~1% of a
+Rs6,000 notional — roughly half the measured edge. No result that excludes costs
+is meaningful.
+
+---
+
 ## 2026-08-29 — Telegram notifier (standalone)
 
 - New `telegram_notifier.py`, a **separate process**. No existing file was

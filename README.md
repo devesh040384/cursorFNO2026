@@ -50,6 +50,9 @@ python3 -m unittest test_suite.py -v
 | `ist_time.py` | Single source of IST wall-clock (all dates/stamps) |
 | `broker_orders.py` | Confirms real fills from the order book (never assumes) |
 | `broker_health.py` | Session re-auth, log rotation, CRITICAL alerting |
+| `backtest_engine.py` | **Separate.** Replays the live strategy over cached history |
+| `backtest_options.py` | Black-Scholes ATM pricing + Angel One cost model |
+| `backtest_data.py` | Candle fetch + CSV cache |
 | `telegram_notifier.py` | **Separate process.** Telegram alerts + remote status. Touches no trading file. |
 | `config.py` | All live knobs |
 
@@ -317,6 +320,49 @@ daily entry count against the per-index cap.
 
 Both are populated only for trades opened after the instrumentation landed;
 older rows have no `dte` / `max_favorable_price` and are excluded.
+
+---
+
+## Backtesting
+
+Forward paper testing yields 4-6 trades a day, so ~40 trades takes a fortnight
+and still lands at t~1.5. The backtest replays the **same strategy code** over
+cached history, turning that into thousands of signals.
+
+```bash
+python3 backtest_data.py --days 365      # pull + cache candles (slow, once)
+python3 backtest_data.py --report        # what is cached
+python3 backtest_engine.py --days 180
+python3 backtest_engine.py --days 180 --set trending_target_mult=1.22
+python3 backtest_engine.py --days 180 --no-costs
+```
+
+**It drives the real code.** There is no reimplementation of the regime
+classifier, RSI, volume gate, entry rules or trailing ladder — the engine
+constructs a real `StrategyBrain` and calls the real `risk_monitors._trailed_stop`
+against a real (temporary) SQLite database, so risk caps, cooldowns and session
+windows all apply. Change the bot, and the backtest changes with it.
+
+Three things are substituted, because they cannot be replayed:
+
+| Substituted | Why |
+|-------------|-----|
+| Clock | A controllable clock replaces `time` in `strategy_brain` and the IST helpers in `database`, so "today" follows the simulated date. Fully reverted afterwards (tested). |
+| Broker | A fake order manager records fills instead of placing orders |
+| Option premium | Expired contracts are delisted, so an ATM contract is repriced from the index path via Black-Scholes |
+
+**Costs are modelled** (~Rs60/round trip: brokerage, STT, exchange, GST, stamp).
+Flat brokerage is ~1% of a Rs6,000 notional — about half the strategy's measured
+edge — so excluding it would flatter every result.
+
+**IV is calibrated per index, not assumed.** Backed out of real fills, NIFTY
+priced at ~13% and SENSEX at ~8%; a single shared default over-priced SENSEX by
+71% and would have changed which parameters looked best.
+
+> **Limits.** The option model has no IV smile, no IV crush around events, and no
+> real bid-ask. Treat absolute rupee results as indicative; the trustworthy
+> output is the *comparison between parameter settings*, where model error
+> largely cancels.
 
 ---
 

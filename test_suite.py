@@ -1,5 +1,6 @@
 import io
 import os
+import shutil
 import tempfile
 import unittest
 import time
@@ -1226,6 +1227,151 @@ class TelegramNotifierTests(unittest.TestCase):
     def test_html_escaping(self):
         import telegram_notifier as tn
         self.assertEqual(tn.esc("<b>&x</b>"), "&lt;b&gt;&amp;x&lt;/b&gt;")
+
+
+class BacktestOptionsTests(unittest.TestCase):
+    """The pricing model is the backtest's foundation; if it is wrong every
+    conclusion drawn from a sweep is wrong."""
+
+    def test_put_call_parity(self):
+        import backtest_options as bo
+        T = bo.years_to_expiry(1, 0)
+        c = bo.black_scholes(24000, 24000, T, 0.14, True)
+        p = bo.black_scholes(24000, 24000, T, 0.14, False)
+        self.assertAlmostEqual(c - p, 0.0, places=6)
+        c2 = bo.black_scholes(24100, 24000, T, 0.14, True)
+        p2 = bo.black_scholes(24100, 24000, T, 0.14, False)
+        self.assertAlmostEqual(c2 - p2, 100.0, places=4)
+
+    def test_expiry_collapses_to_intrinsic(self):
+        import backtest_options as bo
+        self.assertAlmostEqual(bo.black_scholes(24100, 24000, 0, 0.14, True), 100.0)
+        self.assertAlmostEqual(bo.black_scholes(24100, 24000, 0, 0.14, False), 0.0)
+
+    def test_theta_is_steepest_at_zero_dte(self):
+        import backtest_options as bo
+        decay = {}
+        for dte in (0, 1, 3):
+            a = bo.black_scholes(24000, 24000, bo.years_to_expiry(dte, 0), 0.14, True)
+            b = bo.black_scholes(24000, 24000, bo.years_to_expiry(dte, 60), 0.14, True)
+            decay[dte] = (a - b) / a
+        self.assertGreater(decay[0], decay[1])
+        self.assertGreater(decay[1], decay[3])
+
+    def test_implied_iv_round_trips(self):
+        import backtest_options as bo
+        T = bo.years_to_expiry(2, 45)
+        premium = bo.black_scholes(24000, 24000, T, 0.17, True)
+        self.assertAlmostEqual(bo.implied_iv(premium, 24000, 24000, T, True), 0.17, places=4)
+
+    def test_calibration_separates_the_two_indices(self):
+        import backtest_options as bo
+        fills = [
+            ("NIFTY", 24000., 24000., 1, 150, 112.65, True),
+            ("SENSEX", 76900., 76900., 3, 30, 327.25, False),
+        ]
+        cal = bo.calibrate_iv_from_fills(fills)
+        # A single shared IV would misprice one of them; they are genuinely apart.
+        self.assertGreater(cal["NIFTY"], cal["SENSEX"])
+
+    def test_atm_strike_snaps_to_the_grid(self):
+        import backtest_options as bo
+        self.assertEqual(bo.atm_strike(24037, "NIFTY"), 24050)
+        self.assertEqual(bo.atm_strike(81049, "SENSEX"), 81000)
+
+    def test_round_trip_cost_is_dominated_by_flat_brokerage(self):
+        import backtest_options as bo
+        small, large = bo.round_trip_cost(3000), bo.round_trip_cost(8000)
+        self.assertGreater(small / 3000, large / 8000)   # flat fee hurts small trades
+        self.assertAlmostEqual(bo.round_trip_cost(5884), 60.2, delta=1.0)
+
+
+class BacktestEngineTests(unittest.TestCase):
+    def _cache(self, tmpdir, sessions=6):
+        """Write a deterministic synthetic cache and point the loader at it."""
+        import random
+        from datetime import datetime, timedelta
+        import backtest_data as bd
+        from config import INDICES_CONFIG
+        random.seed(11)
+        bd.CACHE_DIR = tmpdir
+        for sym, base in (("NIFTY", 24000.0), ("SENSEX", 78000.0)):
+            cfg = INDICES_CONFIG[sym]
+            for exch, token in ((cfg["exchange"], cfg["index_token"]),
+                                (cfg["option_exchange"], "FUT" + sym)):
+                rows, px, day, made = {}, base, datetime(2026, 6, 1, 9, 15), 0
+                while made < sessions:
+                    if day.weekday() < 5:
+                        t, burst = day, random.randint(20, 45)
+                        for i in range(75):
+                            px *= (1 + random.gauss(0.0009 if burst <= i < burst + 8 else 0, 0.0006))
+                            vol = random.uniform(800, 1500) * (4.0 if burst <= i < burst + 3 else 1.0)
+                            rows[t.isoformat()] = {"timestamp": t.isoformat(), "open": px,
+                                                   "high": px, "low": px, "close": px, "volume": vol}
+                            t += timedelta(minutes=5)
+                        made += 1
+                    day += timedelta(days=1)
+                bd.save_cache(exch, token, rows)
+
+    def test_engine_replays_and_produces_trades(self):
+        import backtest_engine as be
+        import backtest_data as bd
+        original = bd.CACHE_DIR
+        tmpdir = tempfile.mkdtemp()
+        try:
+            self._cache(tmpdir)
+            trades = be.Backtest(cost_model=True).run(days=400)
+            self.assertGreater(len(trades), 0, "engine produced no trades")
+            for t in trades:
+                self.assertIn(t["exit_reason"],
+                              {"TARGET_HIT", "STOP_LOSS_HIT", "TIME_STOP", "EOD_SQUAREOFF"})
+                self.assertAlmostEqual(t["net"], t["gross"] - t["cost"], places=6)
+                self.assertGreater(t["cost"], 0)
+        finally:
+            bd.CACHE_DIR = original
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_costs_reduce_net_and_can_be_disabled(self):
+        import backtest_engine as be
+        import backtest_data as bd
+        original = bd.CACHE_DIR
+        tmpdir = tempfile.mkdtemp()
+        try:
+            self._cache(tmpdir)
+            with_costs = be.Backtest(cost_model=True).run(days=400)
+            without = be.Backtest(cost_model=False).run(days=400)
+            self.assertEqual(len(with_costs), len(without))
+            self.assertGreater(sum(t["net"] for t in without),
+                               sum(t["net"] for t in with_costs))
+            self.assertTrue(all(t["cost"] == 0 for t in without))
+        finally:
+            bd.CACHE_DIR = original
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_clock_patches_are_fully_reverted(self):
+        """A leaked clock patch would corrupt the live modules for anything
+        running in the same process."""
+        import backtest_engine as be
+        import database
+        import strategy_brain
+        before = (strategy_brain.time, strategy_brain.ist_hhmm,
+                  database.ist_today, database.ist_stamp)
+        bt = be.Backtest()
+        bt._install()
+        self.assertIsNot(strategy_brain.time, before[0])
+        bt._restore()
+        self.assertEqual((strategy_brain.time, strategy_brain.ist_hhmm,
+                          database.ist_today, database.ist_stamp), before)
+
+    def test_dte_follows_the_simulated_date(self):
+        from datetime import datetime
+        import backtest_engine as be
+        bt = be.Backtest(expiry_weekday={"NIFTY": 1, "SENSEX": 3})
+        bt.clock.set(datetime(2026, 8, 31, 10, 0))       # a Monday
+        self.assertEqual(bt.dte_for("NIFTY"), 1)          # Tuesday expiry
+        self.assertEqual(bt.dte_for("SENSEX"), 3)         # Thursday expiry
+        bt.clock.set(datetime(2026, 9, 1, 10, 0))         # Tuesday
+        self.assertEqual(bt.dte_for("NIFTY"), 0)          # expiry day
 
 
 if __name__ == "__main__":
