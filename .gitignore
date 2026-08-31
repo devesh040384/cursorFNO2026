@@ -14,3 +14,4 @@ trade_history.db-journal
 rsi_state.json
 *.log
 logs/
+backtest_cache/
