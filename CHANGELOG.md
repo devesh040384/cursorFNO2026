@@ -4,6 +4,23 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-01 — NIFTY history token (backtest tooling)
+
+- `getCandleData` returned an **empty series** for NIFTY, silently: token `26000`
+  is the *websocket* form. The candle API needs the AMXIDX form,
+  **`99926000` ("Nifty 50")**. SENSEX already used its AMXIDX token
+  (`99919000`) for both, which is why only NIFTY came back empty.
+- Added `history_token` per index plus a `history_token()` helper.
+  `index_token` is **unchanged** — the live websocket depends on it.
+- Wired into `backtest_data.py`, `backtest_engine.py` and `trade_analysis.py`.
+
+**Open question:** `history_seeder.py:106` still uses `index_token`, so live
+NIFTY seeding may be failing silently the same way. Confirm with
+`grep "\[seed\]" trading_bot.log` before changing anything — the fix would
+alter which trades NIFTY takes, so it is a Sep 15 decision, not a mid-window one.
+
+---
+
 ## 2026-09-01 — Multi-timeframe scaffolding (inert)
 
 - New `timeframes.py`: 1-minute bar aggregation, a pending-entry state machine

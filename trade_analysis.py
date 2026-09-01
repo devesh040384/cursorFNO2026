@@ -26,7 +26,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 import backtest_data as bd
-from config import INDICES_CONFIG
+from config import INDICES_CONFIG, history_token
 from database import DatabaseManager
 from ist_time import ist_today
 
@@ -129,7 +129,7 @@ def load_index_bars(symbol, needed_days):
     cfg = INDICES_CONFIG.get(symbol)
     if not cfg:
         return []
-    bars = bd.load_series(cfg["exchange"], cfg["index_token"])
+    bars = bd.load_series(cfg["exchange"], history_token(symbol))
     if not bars:
         logging.warning("%s: no cached index candles. Run backtest_data.py first.", symbol)
     elif needed_days:

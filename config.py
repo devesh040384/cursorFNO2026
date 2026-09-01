@@ -104,6 +104,12 @@ def daily_entry_cap():
     return int(RISK["max_daily_entries"])
 
 
+def history_token(symbol):
+    """Token for getCandleData. Falls back to the websocket token when unset."""
+    cfg = INDICES_CONFIG.get(symbol) or {}
+    return str(cfg.get("history_token") or cfg.get("index_token") or "")
+
+
 def index_daily_entry_cap():
     """Per-index daily entry budget (paper gets the looser one)."""
     if PAPER_TRADING:
@@ -139,7 +145,13 @@ FALLBACK_LOT_SIZE = {
 INDICES_CONFIG = {
     "NIFTY": {
         "token": "26000",
+        # Websocket subscription token. Do NOT change: the live feed uses it.
         "index_token": "26000",
+        # getCandleData needs the AMXIDX form instead ("Nifty 50", 99926000).
+        # The websocket token returns an empty candle series, silently.
+        # SENSEX happens to use the AMXIDX token for both, which is why only
+        # NIFTY history came back empty.
+        "history_token": "99926000",
         "exchange": "NSE",
         "option_exchange": "NFO",
         "fut_exchange_type": 2,
@@ -161,6 +173,7 @@ INDICES_CONFIG = {
     "SENSEX": {
         "token": "99919000",
         "index_token": "99919000",
+        "history_token": "99919000",   # already the AMXIDX form
         "exchange": "BSE",
         "option_exchange": "BFO",
         "fut_exchange_type": 4,
