@@ -21,6 +21,7 @@ Deliberately a SEPARATE, POST-HOC tool rather than live tick tracking:
 """
 import argparse
 import logging
+import math
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -155,6 +156,35 @@ def classify(pnl, mfe_pct, mae_pct, favourable_threshold=0.15):
     return "SIGNAL_WRONG"        # index never went our way
 
 
+# Median of a driftless Brownian running maximum is 0.6745 * sigma * sqrt(t).
+BROWNIAN_MEDIAN_FACTOR = 0.6745
+
+
+def _norm_sf(z):
+    return 0.5 * math.erfc(z / math.sqrt(2.0))
+
+
+def random_walk_baseline(sigma_per_min, minutes, threshold=0.15):
+    """What a coin flip would produce over the same window.
+
+    Without this, a forward-excursion table reads as encouraging purely because
+    a running maximum grows as sqrt(t) for ANY series. The question is never
+    "does the move get bigger with more time" — it always does — but "does it
+    get bigger than diffusion alone would give".
+    """
+    scale = sigma_per_min * math.sqrt(minutes)
+    if scale <= 0:
+        return 0.0, 0.0
+    return BROWNIAN_MEDIAN_FACTOR * scale, 100.0 * 2.0 * _norm_sf(threshold / scale)
+
+
+def implied_sigma_per_min(median_mfe, minutes):
+    """Back out per-minute vol from an observed median excursion."""
+    if minutes <= 0 or median_mfe <= 0:
+        return 0.0
+    return median_mfe / (BROWNIAN_MEDIAN_FACTOR * math.sqrt(minutes))
+
+
 def load_index_bars(symbol, needed_days):
     cfg = INDICES_CONFIG.get(symbol)
     if not cfg:
@@ -276,17 +306,51 @@ def report(db_path=DB_FILE, days=7):
             reach = 100.0 * sum(1 for v in vals if v >= 0.15) / len(vals)
             lines.append("    %-14s %5.1f%%  (median %.3f%%)"
                          % (label, reach, sorted(vals)[len(vals) // 2]))
-        lines += ["",
-                  "    If the longer windows reach far more often than 'held only',",
-                  "    the signal works and the stop is cutting it off. If they do not,",
-                  "    the signal does not predict movement."]
+        anchor_med = None
+        vals15 = sorted(v for v in (r["fwd_mfe_15m"] for r in have_fwd) if v is not None)
+        if vals15:
+            anchor_med = vals15[len(vals15) // 2]
+        sigma = implied_sigma_per_min(anchor_med, 15) if anchor_med else 0.0
+        if sigma > 0:
+            lines += ["", "    vs a RANDOM WALK calibrated to the 15-min point",
+                      "    (a running maximum grows as sqrt(t) for ANY series, so a rising",
+                      "     column proves nothing on its own)", "",
+                      "    %-9s %10s %10s %9s %9s" % ("window", "med obs", "med rand", "reach", "rand")]
+            beat = False
+            for label, key, minutes in (("15 min", "fwd_mfe_15m", 15),
+                                        ("30 min", "fwd_mfe_30m", 30),
+                                        ("45 min", "fwd_mfe_45m", 45)):
+                vals = sorted(v for v in (r[key] for r in have_fwd) if v is not None)
+                if not vals:
+                    continue
+                med = vals[len(vals) // 2]
+                reach = 100.0 * sum(1 for v in vals if v >= 0.15) / len(vals)
+                med_r, reach_r = random_walk_baseline(sigma, minutes)
+                beat = beat or reach > reach_r
+                lines.append("    %-9s %9.3f%% %9.3f%% %8.1f%% %8.1f%%"
+                             % (label, med, med_r, reach, reach_r))
+            lines.append("")
+            if beat:
+                lines.append("    Beats the baseline somewhere — worth investigating.")
+            else:
+                lines += ["    Does NOT beat a random walk at any window. The growth across",
+                          "    columns is diffusion, not prediction: these entries are no",
+                          "    better timed than picking a moment at random."]
 
     losses = [r for r in rows if ((r["exit_price"] or 0) - (r["entry_price"] or 0)) < 0]
     if losses:
         exit_wrong = [r for r in losses if r["signal_verdict"] == "EXIT_WRONG"]
+        pct = 100.0 * len(exit_wrong) / len(losses)
         lines += ["", "  Of %d losing trades, %d had the index move our way first (%.0f%%)."
-                  % (len(losses), len(exit_wrong), 100.0 * len(exit_wrong) / len(losses)),
-                  "  Those are exit problems, not signal problems."]
+                  % (len(losses), len(exit_wrong), pct)]
+        # This asserted "exit problems" unconditionally, including when the count
+        # was zero — which stated the exact opposite of the finding.
+        if pct >= 50:
+            lines.append("  Most losses are EXIT problems: the move was there and we lost anyway.")
+        elif len(exit_wrong):
+            lines.append("  A minority are exit problems; the rest never had a move to catch.")
+        else:
+            lines.append("  None are exit problems: no losing trade ever had a move to catch.")
     lines.append("=" * 72)
     return lines
 

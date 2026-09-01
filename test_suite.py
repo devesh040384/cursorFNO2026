@@ -1775,5 +1775,46 @@ class ForwardExcursionTests(unittest.TestCase):
         self.assertIsNone(ta.forward_excursion(self._bars(), None, 30, True))
 
 
+
+class RandomWalkBaselineTests(unittest.TestCase):
+    """A forward-excursion table always rises with time, because a running
+    maximum grows as sqrt(t) for any series. Only beating that is evidence."""
+
+    def test_baseline_scales_as_sqrt_t(self):
+        import trade_analysis as ta
+        med15, _ = ta.random_walk_baseline(0.03, 15)
+        med60, _ = ta.random_walk_baseline(0.03, 60)
+        self.assertAlmostEqual(med60 / med15, 2.0, places=6)   # 4x time -> 2x
+
+    def test_reach_probability_rises_with_time(self):
+        import trade_analysis as ta
+        _, r15 = ta.random_walk_baseline(0.03, 15)
+        _, r45 = ta.random_walk_baseline(0.03, 45)
+        self.assertLess(r15, r45)
+        self.assertTrue(0 <= r15 <= 100 and 0 <= r45 <= 100)
+
+    def test_sigma_round_trips(self):
+        import trade_analysis as ta
+        sigma = ta.implied_sigma_per_min(0.079, 15)
+        med, _ = ta.random_walk_baseline(sigma, 15)
+        self.assertAlmostEqual(med, 0.079, places=6)
+
+    def test_live_data_does_not_beat_the_baseline(self):
+        """Pins the Sep 2026 finding: observed reach sits below diffusion at
+        every window, so the growth in the table is not predictive power."""
+        import trade_analysis as ta
+        sigma = ta.implied_sigma_per_min(0.079, 15)
+        for minutes, observed_reach in ((15, 16.7), (30, 26.7), (45, 30.0)):
+            _, baseline = ta.random_walk_baseline(sigma, minutes)
+            self.assertLess(observed_reach, baseline,
+                            "%dm unexpectedly beat the random walk" % minutes)
+
+    def test_degenerate_inputs(self):
+        import trade_analysis as ta
+        self.assertEqual(ta.random_walk_baseline(0.0, 30), (0.0, 0.0))
+        self.assertEqual(ta.implied_sigma_per_min(0.0, 15), 0.0)
+        self.assertEqual(ta.implied_sigma_per_min(0.079, 0), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
