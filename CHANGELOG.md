@@ -4,6 +4,20 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-01 — Index excursion analysis
+
+- New `trade_analysis.py` backfills, per closed trade, where the **index** went
+  while the position was open: entry/high/low/exit, favourable and adverse
+  excursion as a percentage, and a verdict.
+- Splits losses into `EXIT_WRONG` (index moved our way, we still lost) and
+  `SIGNAL_WRONG` (index never moved our way) — the distinction that decides
+  whether to fix entries or exits.
+- Sign convention is direction-aware: for a PE a falling index is favourable.
+- Post-hoc and standalone, so it touches no trading file and is safe to run
+  during the frozen config window. Works retroactively on existing trades.
+
+---
+
 ## 2026-09-01 — Backtest harness
 
 - `backtest_engine.py` replays the **live** `StrategyBrain` and the real
