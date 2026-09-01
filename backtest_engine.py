@@ -144,7 +144,7 @@ class Position:
 
 
 class Backtest:
-    def __init__(self, expiry_weekday=None, cost_model=True, verbose=False):
+    def __init__(self, expiry_weekday=None, cost_model=True, verbose=False, iv_override=None):
         self.clock = Clock()
         self.spot = {}
         self.iv = {}
@@ -154,6 +154,11 @@ class Backtest:
         self.token_seq = 0
         self.cost_model = cost_model
         self.verbose = verbose
+        # Results are highly sensitive to IV: too low makes options cheap, so the
+        # same index move is a bigger percentage swing and the -10% stop trips on
+        # noise. realised vol is a floor, not implied — override with values
+        # calibrated from real fills whenever you have them.
+        self.iv_override = dict(iv_override or {})
         # NIFTY weekly expires Tue(1), SENSEX Thu(3). Override if the exchange
         # calendar changes — this drives the whole DTE analysis.
         self.expiry_weekday = expiry_weekday or {"NIFTY": 1, "SENSEX": 3}
@@ -222,27 +227,55 @@ class Backtest:
             logging.info("  %s EXIT  %s %s @ %.2f  net %+.0f",
                          self.clock.stamp(), index, why, price, gross - cost)
 
-    def manage_exits(self, index):
-        """Target, stop, trailing ladder and time-stop — using the live rules."""
+    def manage_exits(self, index, bar=None):
+        """Target, stop, trailing ladder and time-stop — using the live rules.
+
+        Resolved at the bar's EXTREMES, not just its close. Live, the trailing
+        monitor polls every 5 seconds, so it sees a target touched anywhere
+        inside a 5-minute bar; checking only the close silently discards those
+        fills, and target hits average ~4x the size of a stop.
+
+        Where both extremes would have triggered within one bar the ordering is
+        unknowable, so the adverse one is assumed first. That is pessimistic by
+        construction, which is the right direction for a backtest to err.
+        """
         from risk_monitors import _trailed_stop
 
         pos = self.open_positions.get(index)
         if pos is None:
             return
-        price = pos.contract.price(self.spot[index], self.clock.minutes_elapsed())
-        if price <= 0:
+        mins = self.clock.minutes_elapsed()
+        close_price = pos.contract.price(self.spot[index], mins)
+        if close_price <= 0:
             return
-        if pos.target and price >= pos.target:
-            return self.close_position(index, price, "TARGET_HIT")
-        if pos.stop and price <= pos.stop:
-            return self.close_position(index, price, "STOP_LOSS_HIT")
+
+        # An option is monotonic in spot: a call is worth most at the bar high,
+        # a put at the bar low.
+        if bar is not None:
+            is_call = pos.contract.is_call
+            fav_spot = bar["high"] if is_call else bar["low"]
+            adv_spot = bar["low"] if is_call else bar["high"]
+            adv_price = pos.contract.price(adv_spot, mins)
+            fav_price = pos.contract.price(fav_spot, mins)
+
+            if pos.stop and adv_price <= pos.stop:
+                return self.close_position(index, pos.stop, "STOP_LOSS_HIT")
+            if pos.target and fav_price >= pos.target:
+                return self.close_position(index, pos.target, "TARGET_HIT")
+            # The trail must also see the excursion, not just the close.
+            pos.peak = max(pos.peak, fav_price)
+        else:
+            if pos.stop and close_price <= pos.stop:
+                return self.close_position(index, pos.stop, "STOP_LOSS_HIT")
+            if pos.target and close_price >= pos.target:
+                return self.close_position(index, pos.target, "TARGET_HIT")
 
         held = (self.clock.dt - pos.opened_at).total_seconds() / 60.0
-        if held >= RISK["time_stop_minutes"] and price < pos.entry * RISK["time_stop_min_gain_mult"]:
-            return self.close_position(index, price, "TIME_STOP")
+        if held >= RISK["time_stop_minutes"] and close_price < pos.entry * RISK["time_stop_min_gain_mult"]:
+            return self.close_position(index, close_price, "TIME_STOP")
 
-        pos.peak = max(pos.peak, price)
-        pos.stop = _trailed_stop(pos.entry, pos.peak, price, pos.stop)
+        pos.peak = max(pos.peak, close_price)
+        pos.stop = _trailed_stop(pos.entry, pos.peak, close_price, pos.stop)
 
     # ---------------------------------------------------------------- the replay
 
@@ -259,7 +292,8 @@ class Backtest:
                 logging.error("%s: no cached index bars. Run backtest_data.py first.", symbol)
                 continue
             series[symbol] = bd.group_by_session(bars)
-            self.iv[symbol] = bo.realised_iv([b["close"] for b in bars[-2000:]])
+            self.iv[symbol] = self.iv_override.get(
+                symbol, bo.realised_iv([b["close"] for b in bars[-2000:]]))
         if not series:
             return []
 
@@ -338,7 +372,7 @@ class Backtest:
                 if not bar:
                     continue
                 self.spot[symbol] = bar["close"]
-                self.manage_exits(symbol)
+                self.manage_exits(symbol, bar)
                 brain.evaluate_tick(symbol, bar["close"])
 
         # Square off whatever is still open, as the 15:15 kill switch does.
@@ -420,13 +454,23 @@ def main(argv=None):
     parser.add_argument("--indices", nargs="*")
     parser.add_argument("--set", dest="overrides", nargs="*", help="key=value config overrides")
     parser.add_argument("--no-costs", action="store_true", help="exclude brokerage/taxes")
+    parser.add_argument("--iv", nargs="*", metavar="INDEX=PCT",
+                        help="override implied vol, e.g. --iv NIFTY=13.1 SENSEX=8.2 "
+                             "(calibrated from real fills; default is realised vol)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(message)s")
     apply_overrides(args.overrides)
-    bt = Backtest(cost_model=not args.no_costs, verbose=args.verbose)
+    iv = {}
+    for pair in args.iv or []:
+        key, _, raw = pair.partition("=")
+        try:
+            iv[key.strip().upper()] = float(raw) / 100.0
+        except ValueError:
+            logging.warning("ignoring bad --iv value %r", pair)
+    bt = Backtest(cost_model=not args.no_costs, verbose=args.verbose, iv_override=iv)
     trades = bt.run(days=args.days, indices=args.indices)
     print("\n".join(summarise(trades, "BACKTEST  %d sessions requested" % args.days)))
     return 0
