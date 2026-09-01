@@ -67,8 +67,14 @@ and the futures RVOL window. The in-progress candle is dropped and no breakout
 event is carried over. Entries are then gated only by `session_start_hhmm`
 (**09:45**), which skips the opening-auction noise.
 
-If the candle API fails or returns too few bars, the bot logs a warning and falls
-back to the old live warmup — it does not trade on partial history.
+Candles are fetched with each index's `history_token`, **not** its websocket
+token: `getCandleData` returns an empty series for the websocket form and does
+so silently (`status=True`, empty list). That cost NIFTY the 09:45–10:50 window
+every session until 2026-09-02.
+
+If the candle API fails or returns too few bars, the bot logs an **ERROR**
+naming the consequence and falls back to live warmup — it does not trade on
+partial history. Check the `[seed]` lines every morning.
 
 **Hybrid timeframe**
 

@@ -4,6 +4,40 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-02 — Fix silent NIFTY seeding failure (LIVE)
+
+**This is a behavioural fix, not tooling.** `history_seeder.py` asked for candles
+with `index_token`, which for NIFTY is the *websocket* token `26000`. That
+returns `status=True` with an **empty list** — no error, no rejection — so
+seeding failed silently and NIFTY fell back to cold live warmup every session.
+
+Evidence, all three agreeing:
+
+| | |
+|---|---|
+| `getCandleData` with `26000` | 0 rows (twice) |
+| `getCandleData` with `99926000` | 23,336 rows |
+| Cold warmup from pre-open ticks | 22nd bar at **10:50** |
+| NIFTY first trade, Sep 1 | **10:50:02** |
+| SENSEX first trade, Aug 31 | 09:45:03 — only possible if seeded |
+
+SENSEX's `index_token` already *is* its AMXIDX token, which is why only NIFTY
+was affected and why the failure went unnoticed.
+
+- Seeder now uses `history_token()`.
+- The failure is logged at **ERROR** and states the consequence
+  (*"NO ENTRIES until ~10:50 IST"*) rather than a quiet warning. The old warning
+  was present in the log for two sessions and nobody read it.
+- Fixed a latent backtest bug where futures discovery skipped only the websocket
+  token, so an index cached under its history token could be read as futures.
+
+**Expect NIFTY behaviour to change from the next session:** entries become
+possible from 09:45 instead of ~10:50, so NIFTY will take more trades per day
+and may reach its 6/day per-index cap earlier. The NIFTY forward sample restarts
+here; SENSEX is unaffected.
+
+---
+
 ## 2026-09-01 — NIFTY history token (backtest tooling)
 
 - `getCandleData` returned an **empty series** for NIFTY, silently: token `26000`

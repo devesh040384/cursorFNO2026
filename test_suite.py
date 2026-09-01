@@ -1646,5 +1646,75 @@ class StructuralStopTests(unittest.TestCase):
         self.assertIsNone(tf.structural_stop_level(True, self._bars(), 23990.0))
 
 
+
+class TokenAwareCandleAPI:
+    """Mimics the real failure: the websocket token returns status=True with an
+    EMPTY data list, so nothing looks like an error and the cache stays empty."""
+
+    WORKING = {"99926000", "99919000"}
+
+    def __init__(self, bars=60):
+        self.bars = bars
+        self.requested = []
+
+    def getCandleData(self, params):
+        from datetime import datetime, timedelta, timezone
+        self.requested.append(params["symboltoken"])
+        if str(params["symboltoken"]) not in self.WORKING:
+            return {"status": True, "data": []}      # the silent failure
+        ist = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(timezone.utc).astimezone(ist)
+        secs = now.hour * 3600 + now.minute * 60 + now.second
+        cur = now - timedelta(seconds=secs % 300, microseconds=now.microsecond)
+        data = []
+        for i in range(self.bars, -1, -1):
+            ts = cur - timedelta(minutes=5) * i
+            px = 24000.0 + (self.bars - i)
+            data.append([ts.isoformat(), px, px + 5, px - 5, px + 1, 100000.0])
+        return {"status": True, "data": data}
+
+
+class NiftySeedingTests(unittest.TestCase):
+    """NIFTY seeding failed silently because the seeder asked for candles with
+    the websocket token. This pins the fix."""
+
+    def test_seeder_requests_the_history_token(self):
+        import history_seeder
+        from config import history_token
+        brain = StrategyBrain(order_engine=None, options_builders={})
+        api = TokenAwareCandleAPI()
+        bars = history_seeder.seed_price_history(api, brain, "NIFTY")
+        self.assertGreater(bars, 0, "NIFTY did not seed")
+        self.assertIn(history_token("NIFTY"), api.requested)
+        self.assertNotIn("26000", api.requested)
+
+    def test_both_indices_seed(self):
+        import history_seeder
+        for symbol in ("NIFTY", "SENSEX"):
+            brain = StrategyBrain(order_engine=None, options_builders={})
+            self.assertGreater(
+                history_seeder.seed_price_history(TokenAwareCandleAPI(), brain, symbol), 0,
+                "%s did not seed" % symbol)
+            # 22 bars is the threshold evaluate_tick needs before it will trade.
+            self.assertGreaterEqual(len(brain.price_histories[symbol]) - 1, 22)
+
+    def test_websocket_token_would_still_fail(self):
+        """Guards the diagnosis itself: if 26000 ever starts working, this test
+        fails and the comment in history_seeder needs revisiting."""
+        api = TokenAwareCandleAPI()
+        self.assertEqual(api.getCandleData({"symboltoken": "26000"})["data"], [])
+
+    def test_empty_seed_is_logged_at_error(self):
+        import history_seeder
+        brain = StrategyBrain(order_engine=None, options_builders={})
+        api = TokenAwareCandleAPI()
+        api.WORKING = set()                      # nothing resolves
+        with self.assertLogs(level="ERROR") as captured:
+            self.assertEqual(history_seeder.seed_price_history(api, brain, "NIFTY"), 0)
+        joined = " ".join(captured.output)
+        # A silent warning is what let this run unnoticed for two sessions.
+        self.assertIn("NO ENTRIES", joined)
+
+
 if __name__ == "__main__":
     unittest.main()

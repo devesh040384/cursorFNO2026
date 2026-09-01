@@ -9,7 +9,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
-from config import INDICES_CONFIG, RISK, signal_bar_bucket, signal_bar_sec
+from config import INDICES_CONFIG, RISK, history_token, signal_bar_bucket, signal_bar_sec
 from indicators import wilder_rsi
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -102,11 +102,19 @@ def seed_price_history(smart_api, brain, symbol, bars=SEED_BARS):
         logging.warning(f"[seed] no candle interval for bar={signal_bar_sec()}s; {symbol} not seeded")
         return 0
 
+    # getCandleData needs the AMXIDX token, not the websocket one. NIFTY's
+    # index_token (26000) returns an EMPTY series with status=True, so seeding
+    # failed silently and NIFTY ran on cold warmup — no entries until ~10:50.
+    token = history_token(symbol)
     rows = _drop_forming_bar(
-        fetch_candles(smart_api, cfg.get("exchange", "NSE"), cfg.get("index_token"), interval)
+        fetch_candles(smart_api, cfg.get("exchange", "NSE"), token, interval)
     )
     if len(rows) < 22:
-        logging.warning(f"[seed] {symbol}: only {len(rows)} closed bars returned; live warmup still needed")
+        logging.error(
+            f"[seed] {symbol}: only {len(rows)} closed bars from {cfg.get('exchange')}:{token}. "
+            f"Falling back to live warmup — NO ENTRIES until ~22 bars have built "
+            f"(roughly 10:50 IST). Check the candle token for this index."
+        )
         return 0
 
     closes = [r[4] for r in rows[-bars:]]

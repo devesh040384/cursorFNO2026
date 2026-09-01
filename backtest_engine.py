@@ -296,8 +296,8 @@ class Backtest:
             for name in os.listdir(bd.CACHE_DIR):
                 if name.startswith(exchange + "_") and name.endswith(".csv"):
                     token = name[:-4].split("_")[1]
-                    if str(token) == str(cfg["index_token"]):
-                        continue  # that is the index itself
+                    if str(token) in (str(cfg["index_token"]), str(history_token(symbol))):
+                        continue  # that is the index itself, not a future
                     bars = bd.load_series(exchange, token)
                     if bars:
                         return bars
