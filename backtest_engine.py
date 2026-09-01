@@ -29,7 +29,7 @@ from datetime import datetime, timedelta
 
 import backtest_data as bd
 import backtest_options as bo
-from config import FALLBACK_LOT_SIZE, INDICES_CONFIG, RISK
+from config import FALLBACK_LOT_SIZE, INDICES_CONFIG, RISK, history_token
 
 MARKET_OPEN_MIN = 9 * 60 + 15
 
@@ -254,7 +254,7 @@ class Backtest:
         series, futures = {}, {}
         for symbol in indices:
             cfg = INDICES_CONFIG[symbol]
-            bars = bd.load_series(cfg["exchange"], cfg["index_token"])
+            bars = bd.load_series(cfg["exchange"], history_token(symbol))
             if not bars:
                 logging.error("%s: no cached index bars. Run backtest_data.py first.", symbol)
                 continue

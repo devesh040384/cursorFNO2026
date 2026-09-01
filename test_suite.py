@@ -6,7 +6,7 @@ import unittest
 import time
 from datetime import datetime
 from risk_manager import RiskManager
-from config import RISK, INDICES_CONFIG
+from config import RISK, INDICES_CONFIG, history_token
 from ist_time import ist_today
 from database import DatabaseManager
 from order_execution import OrderExecutionEngine
@@ -1297,7 +1297,7 @@ class BacktestEngineTests(unittest.TestCase):
         bd.CACHE_DIR = tmpdir
         for sym, base in (("NIFTY", 24000.0), ("SENSEX", 78000.0)):
             cfg = INDICES_CONFIG[sym]
-            for exch, token in ((cfg["exchange"], cfg["index_token"]),
+            for exch, token in ((cfg["exchange"], history_token(sym)),
                                 (cfg["option_exchange"], "FUT" + sym)):
                 rows, px, day, made = {}, base, datetime(2026, 6, 1, 9, 15), 0
                 while made < sessions:
@@ -1445,7 +1445,7 @@ class IndexExcursionTests(unittest.TestCase):
                                        "high": px + 5, "low": px - 5,
                                        "close": px, "volume": 1000}
                 t += timedelta(minutes=5)
-            bd.save_cache(cfg["exchange"], cfg["index_token"], rows)
+            bd.save_cache(cfg["exchange"], history_token("NIFTY"), rows)
 
             DatabaseManager(dbp)
             conn = sqlite3.connect(dbp)

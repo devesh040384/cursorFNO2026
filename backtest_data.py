@@ -15,7 +15,7 @@ import os
 import time
 from datetime import datetime, timedelta
 
-from config import INDICES_CONFIG
+from config import INDICES_CONFIG, history_token
 from ist_time import IST, ist_now
 
 CACHE_DIR = "backtest_cache"
@@ -209,10 +209,11 @@ def main(argv=None):
 
     for symbol in (args.indices or list(INDICES_CONFIG)):
         cfg = INDICES_CONFIG[symbol]
+        token = history_token(symbol)
         for interval in wanted:
             # 1-min is only needed on the index: entry confirmation and the
             # structural stop both read the index, never the option.
-            fetch_range(smart_api, cfg["exchange"], cfg["index_token"], args.days, interval)
+            fetch_range(smart_api, cfg["exchange"], token, args.days, interval)
         builder = DynamicOptionsChainBuilder(index_name=symbol, smart_api=smart_api)
         builder.load_scrip_master(scrip)
         fut = builder.get_nearest_expiry_future()
