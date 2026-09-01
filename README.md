@@ -54,6 +54,7 @@ python3 -m unittest test_suite.py -v
 | `backtest_engine.py` | **Separate.** Replays the live strategy over cached history |
 | `backtest_options.py` | Black-Scholes ATM pricing + Angel One cost model |
 | `backtest_data.py` | Candle fetch + CSV cache |
+| `signal_lab.py` | **Screens signal hypotheses on index data — no options, no costs** |
 | `trade_analysis.py` | **Separate.** Index excursion per trade: signal failure vs exit failure |
 | `telegram_notifier.py` | **Separate process.** Telegram alerts + remote status. Touches no trading file. |
 | `config.py` | All live knobs |
@@ -397,6 +398,40 @@ python3 backtest_data.py --days 30 --also-1min
 > **Defaults reproduce today's behaviour exactly, and nothing in the live path
 > reads these yet.** Do not move them off their defaults mid-experiment — they
 > change which trades are taken, so the forward sample restarts.
+
+---
+
+## Signal screening (`signal_lab.py`)
+
+A full backtest answers *"does this configuration make money"*, which mixes
+signal quality with option pricing, costs, stops and caps. When the answer is
+no, you cannot tell which part failed — that is exactly what happened to
+`VOLUME_BREAKOUT`.
+
+This asks the prior question: **does the signal predict index movement at all?**
+It reads only index and futures candles. A signal that cannot beat its own
+unconditional baseline here will not be rescued by any stop or target tuning,
+and does not deserve a backtest.
+
+```bash
+python3 signal_lab.py                        # screen every hypothesis
+python3 signal_lab.py --signals orb nr7
+python3 signal_lab.py --index NIFTY --windows 15 30 60 90
+```
+
+Reports the **signed** forward index return in the direction each signal called.
+Under no edge that mean is zero, so the test is a t-test against zero, with the
+unconditional baseline printed above for comparison.
+
+**Multiple testing is handled explicitly.** Screening N hypotheses across M
+windows guarantees some will look good by chance — validation on a pure random
+walk produced a `t = 2.03` false positive at the raw 1.96 bar. The report prints
+the Bonferroni-corrected threshold (|t| > 3.20 for 36 tests) and only flags
+signals that clear it.
+
+Signals shipped: `volume_breakout` (the current live one, as a control), `orb`
+(opening-range break), `mean_reversion`, `nr7` (range contraction then break),
+`ema_trend`, `first_hour`. Adding one is a function in `SIGNALS`.
 
 ---
 

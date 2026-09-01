@@ -4,6 +4,123 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-02 — Signal screening lab
+
+`VOLUME_BREAKOUT` failed, but a full backtest could not say *which part* failed:
+signal, option model, costs, stops and caps all move together in it.
+
+`signal_lab.py` isolates the prior question — does a signal predict index
+movement at all? — using only index and futures candles. No option model, no
+costs, no execution. It measures the **signed** forward index return in the
+direction the signal called, which is zero under no edge, and t-tests it against
+zero with the unconditional distribution printed for comparison.
+
+**Validated against known answers before use:**
+
+| Data | Signal | t | Correct? |
+|------|--------|---|----------|
+| pure random walk | volume_breakout | 0.26 | null, as required |
+| pure random walk | mean_reversion | −1.31 | null, as required |
+| pure random walk | ema_trend | **2.03** | **false positive at the raw bar** |
+| momentum injected | volume_breakout | 5.58 | detects it |
+| momentum injected | mean_reversion | −7.07 | correctly negative |
+
+That false positive on data with zero edge by construction is why the report
+prints a Bonferroni-corrected threshold (|t| > 3.20 across 36 tests) and flags
+only signals clearing it.
+
+Six hypotheses ship, including the current live signal as a control.
+
+---
+
+## 2026-09-02 — Random-walk baseline (the signal does not predict)
+
+The forward-excursion table looked encouraging — reach rose 10% → 16.7% → 26.7%
+→ 30% across held/15/30/45 min. It is not encouraging. **A running maximum grows
+as √t for any series**, so a rising column proves nothing on its own.
+
+Calibrating a driftless random walk to the 15-min point (σ 0.0302%/min,
+~9.3% annualised):
+
+| window | reach observed | reach random |
+|--------|----------------|--------------|
+| 15 min | 16.7% | 20.0% |
+| 30 min | 26.7% | 36.5% |
+| 45 min | 30.0% | 46.0% |
+
+**Observed sits below diffusion at every window, and the gap widens.** Median
+excursion grows 1.51× from 15 to 45 min where a coin flip gives 1.73×. The
+entries are not better timed than picking a moment at random.
+
+The report now prints this baseline alongside the observations so the table
+cannot be misread the same way again.
+
+Also fixed a reporting bug: the verdict line asserted *"Those are exit problems,
+not signal problems"* unconditionally — including when zero losing trades
+qualified, which stated the exact opposite of the finding.
+
+**Three independent lines now agree the signal has no edge:** the 1,146-trade
+backtest (t = −6.5), live index excursion (median 0.08% move after a signal),
+and this baseline comparison. The first depends on a synthetic option model; the
+other two do not.
+
+---
+
+## 2026-09-02 — Forward index excursion
+
+The first excursion report read *"of 16 losing trades, 0 had the index move our
+way first"* — apparently proving exits were fine and the signal was dead. That
+conclusion was not safe.
+
+MFE was measured over the **holding window only**, and Sep 1's median hold was
+4.1 minutes (one trade lasted 1.6). Such a window cannot show a 0.15% index move
+even if one arrived at minute 10, so `SIGNAL_WRONG` was conflating *"the signal
+did not predict a move"* with *"we exited before the move appeared"*.
+
+Adds `fwd_mfe_15m / 30m / 45m`: best favourable index move within a fixed window
+of entry, **regardless of when we actually exited**. The report contrasts them
+with the held-window figure.
+
+- longer windows reach 0.15% far more often → the signal works, the stop is too tight
+- they do not → the signal genuinely does not predict movement, matching the backtest
+
+Verified on a constructed case: a trade stopped out at minute 4, into a move
+starting at minute 10, shows held-MFE 0.09% but forward-30m 0.51%. The old tool
+called that `SIGNAL_WRONG`.
+
+---
+
+## 2026-09-02 — Backtest: intra-bar exits + IV override
+
+First 365-session run showed all three configs losing (~−₹112k, PF 0.75, win
+rate 29–30%) and the three landing within 7% of each other. Two engine issues
+surfaced.
+
+**Intra-bar exit resolution (bug).** `manage_exits` ran once per 5-minute bar
+while the live monitor polls every 5 seconds, so a target or stop touched inside
+a bar was invisible. Now repriced at the bar's extremes — a call is worth most
+at the bar high, a put at the bar low. Where both extremes would trigger in one
+bar the ordering is unknowable, so the adverse one is assumed first.
+
+Note this made results **worse**, not better: with a −10% stop against a +30%
+target, intra-bar noise reaches the stop far more often than the target. The
+correction is still right — it matches live polling — but it did not explain the
+gap between the backtest and live paper results.
+
+**IV is estimated, and results are very sensitive to it.** The engine used
+*realised* vol; implied normally trades above realised, and under-stating IV
+makes options cheap, so the same index move becomes a larger percentage swing
+and trips the −10% stop on noise. A 0.30% adverse NIFTY move costs −47% of
+premium at 8% IV but −26% at 16%. Added `--iv NIFTY=13.1 SENSEX=8.2` so the
+values calibrated from real fills can be used instead of an estimate.
+
+**Correction to earlier analysis:** I read the live-vs-backtest win rate gap
+(50% vs 29.5%) as evidence the backtest was wrong. With n=16, P(≥ 8 wins) under
+a true 29.5% rate is 6.8% — not rare. Sixteen trades cannot distinguish 30% from
+50%, and the live sample may simply have started lucky.
+
+---
+
 ## 2026-09-02 — Fix silent NIFTY seeding failure (LIVE)
 
 **This is a behavioural fix, not tooling.** `history_seeder.py` asked for candles

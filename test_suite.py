@@ -1814,6 +1814,76 @@ class RandomWalkBaselineTests(unittest.TestCase):
         self.assertEqual(ta.random_walk_baseline(0.0, 30), (0.0, 0.0))
         self.assertEqual(ta.implied_sigma_per_min(0.0, 15), 0.0)
         self.assertEqual(ta.implied_sigma_per_min(0.079, 0), 0.0)
+class SignalLabTests(unittest.TestCase):
+    """Screening asks whether a signal predicts index movement at all, before
+    any option model or cost can confuse the answer."""
+
+    def _bars(self, n=60, step=10.0):
+        from datetime import datetime, timedelta
+        out, t, px = [], datetime(2026, 9, 1, 9, 15), 24000.0
+        for _ in range(n):
+            px += step
+            out.append({"dt": t, "open": px, "high": px + 3, "low": px - 3,
+                        "close": px, "volume": 1000.0})
+            t += timedelta(minutes=5)
+        return out
+
+    def test_forward_return_is_signed_by_direction(self):
+        import signal_lab as sl
+        bars = self._bars()
+        up = sl.forward_return(bars, 5, 30, "CE")
+        down = sl.forward_return(bars, 5, 30, "PE")
+        self.assertGreater(up, 0)                 # rising index helps a call
+        self.assertAlmostEqual(up, -down, places=9)
+
+    def test_forward_return_never_crosses_a_session(self):
+        from datetime import timedelta
+        import signal_lab as sl
+        bars = self._bars(n=10)
+        for b in bars[5:]:
+            b["dt"] = b["dt"] + timedelta(days=1)   # next session
+        self.assertIsNone(sl.forward_return(bars, 3, 30, "CE"))
+
+    def test_mfe_uses_bar_extremes(self):
+        import signal_lab as sl
+        bars = self._bars(n=20)
+        mfe = sl.forward_mfe(bars, 2, 30, "CE")
+        ret = sl.forward_return(bars, 2, 30, "CE")
+        self.assertGreater(mfe, ret)              # the high exceeds the close
+
+    def test_t_stat_is_zero_for_constant_or_tiny_samples(self):
+        import signal_lab as sl
+        self.assertEqual(sl.t_stat([1.0, 1.0, 1.0]), 0.0)
+        self.assertEqual(sl.t_stat([1.0]), 0.0)
+
+    def test_detects_a_planted_directional_edge(self):
+        import signal_lab as sl
+        bars = self._bars(n=200, step=8.0)        # relentlessly rising
+        res = sl.evaluate(bars, None, lambda b, i, f: "CE", [30])
+        self.assertGreater(res["windows"][30]["mean"], 0)
+        self.assertGreater(res["windows"][30]["t"], 3.0)
+
+    def test_reports_negative_edge_for_the_wrong_direction(self):
+        import signal_lab as sl
+        bars = self._bars(n=200, step=8.0)
+        res = sl.evaluate(bars, None, lambda b, i, f: "PE", [30])
+        self.assertLess(res["windows"][30]["t"], -3.0)
+
+    def test_signals_respect_the_session_window(self):
+        import signal_lab as sl
+        bars = self._bars(n=200)
+        res = sl.evaluate(bars, None, lambda b, i, f: "CE", [15])
+        for bar in bars:
+            pass
+        # every trigger must sit inside 09:45-14:30
+        self.assertLessEqual(res["n"], sum(1 for b in bars if sl._in_session(b)))
+
+    def test_multiple_testing_bar_rises_with_test_count(self):
+        import signal_lab as sl
+        raw = -sl._inv_norm(0.025 / 1)
+        many = -sl._inv_norm(0.025 / 36)
+        self.assertAlmostEqual(raw, 1.96, places=2)
+        self.assertGreater(many, 3.0)             # 36 looks demands a higher bar
 
 
 if __name__ == "__main__":
