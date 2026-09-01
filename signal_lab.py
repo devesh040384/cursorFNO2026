@@ -267,6 +267,60 @@ def unconditional(bars, windows):
     return out
 
 
+def slice_sessions(bars, since=None, until=None, first_fraction=None, last_n=None):
+    """Restrict bars to a date range or a share of the sessions.
+
+    Out-of-sample validation is the only defence against data mining. A finding
+    discovered on the full history has to survive on periods it was not found
+    on, or it is a coincidence dressed as an edge.
+    """
+    if not bars:
+        return bars
+    days = sorted({b["dt"].date() for b in bars})
+    if first_fraction is not None:
+        cut = max(1, int(len(days) * first_fraction))
+        keep = set(days[:cut]) if first_fraction > 0 else set()
+        if first_fraction < 0:                       # negative means the tail
+            keep = set(days[int(len(days) * (1 + first_fraction)):])
+        return [b for b in bars if b["dt"].date() in keep]
+    if last_n is not None:
+        keep = set(days[-last_n:])
+        return [b for b in bars if b["dt"].date() in keep]
+    out = bars
+    if since:
+        out = [b for b in out if str(b["dt"].date()) >= since]
+    if until:
+        out = [b for b in out if str(b["dt"].date()) <= until]
+    return out
+
+
+def validate(symbol, name, windows, folds=None):
+    """Run one signal across disjoint periods and report each separately."""
+    bars, fut = load(symbol)
+    if not bars:
+        return []
+    days = sorted({b["dt"].date() for b in bars})
+    folds = folds or [
+        ("first half", dict(first_fraction=0.5)),
+        ("second half", dict(first_fraction=-0.5)),
+        ("last 60 sessions", dict(last_n=60)),
+        ("last 20 sessions", dict(last_n=20)),
+    ]
+    rows = []
+    for label, kwargs in folds:
+        subset = slice_sessions(bars, **kwargs)
+        if not subset:
+            continue
+        sub_fut = None
+        if fut is not None:
+            by_dt = {b["dt"]: f for b, f in zip(bars, fut)}
+            sub_fut = [by_dt.get(b["dt"], {"volume": 0.0}) for b in subset]
+        res = evaluate(subset, sub_fut, SIGNALS[name], windows)
+        sdays = sorted({b["dt"].date() for b in subset})
+        rows.append((label, len(sdays), sdays[0], sdays[-1], res))
+    return rows
+
+
 def load(symbol):
     cfg = INDICES_CONFIG[symbol]
     bars = bd.load_series(cfg["exchange"], history_token(symbol))
@@ -289,6 +343,10 @@ def main(argv=None):
     parser.add_argument("--index", default=None, help="default: every configured index")
     parser.add_argument("--signals", nargs="*", help="default: all")
     parser.add_argument("--windows", nargs="*", type=int, default=list(DEFAULT_WINDOWS))
+    parser.add_argument("--validate", metavar="SIGNAL",
+                        help="out-of-sample check: run one signal across disjoint periods")
+    parser.add_argument("--since", metavar="YYYY-MM-DD")
+    parser.add_argument("--until", metavar="YYYY-MM-DD")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
 
@@ -299,8 +357,44 @@ def main(argv=None):
     bar = 1.96
     corrected = -_inv_norm(0.025 / tests)
 
+    if args.validate:
+        if args.validate not in SIGNALS:
+            print("unknown signal %r. known: %s" % (args.validate, ", ".join(SIGNALS)))
+            return 1
+        for symbol in symbols:
+            rows = validate(symbol, args.validate, args.windows)
+            if not rows:
+                print("%s: no cached candles." % symbol)
+                continue
+            print()
+            print("=" * 78)
+            print("  OUT-OF-SAMPLE VALIDATION — %s / %s" % (symbol, args.validate))
+            print("  A real edge holds on periods it was not discovered on.")
+            print("=" * 78)
+            print("  %-18s %5s %-11s %5s %6s %10s %7s"
+                  % ("period", "days", "from", "win", "n", "mean fwd%", "t"))
+            print("  " + "-" * 72)
+            for label, ndays, d0, d1, res in rows:
+                for w in args.windows:
+                    st = res["windows"].get(w)
+                    if not st:
+                        continue
+                    print("  %-18s %5d %-11s %4dm %6d %+10.4f %7.2f"
+                          % (label, ndays, str(d0), w, st["n"], st["mean"], st["t"]))
+                print()
+        print("  Signs must agree across every period. A flip means the finding")
+        print("  was a coincidence of the window it was discovered in.")
+        print()
+        return 0
+
     for symbol in symbols:
         bars, fut = load(symbol)
+        bars = slice_sessions(bars, since=args.since, until=args.until)
+        if fut is not None and args.__dict__.get("since") or args.__dict__.get("until"):
+            keep = {b["dt"] for b in bars}
+            full, ffut = load(symbol)
+            by_dt = {b["dt"]: f for b, f in zip(full, ffut or [])}
+            fut = [by_dt.get(b["dt"], {"volume": 0.0}) for b in bars] if ffut else None
         if not bars:
             print("%s: no cached candles. Run backtest_data.py first." % symbol)
             continue

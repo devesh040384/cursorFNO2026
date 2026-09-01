@@ -1886,5 +1886,53 @@ class SignalLabTests(unittest.TestCase):
         self.assertGreater(many, 3.0)             # 36 looks demands a higher bar
 
 
+
+class OutOfSampleTests(unittest.TestCase):
+    """A finding discovered on the full history must survive on periods it was
+    not found on. Splits therefore have to be genuinely disjoint."""
+
+    def _bars(self, sessions=100):
+        from datetime import datetime, timedelta
+        out, d, made = [], datetime(2026, 1, 5, 9, 15), 0
+        while made < sessions:
+            if d.weekday() < 5:
+                t = d
+                for _ in range(75):
+                    out.append({"dt": t, "open": 100.0, "high": 101.0,
+                                "low": 99.0, "close": 100.0, "volume": 1.0})
+                    t += timedelta(minutes=5)
+                made += 1
+            d += timedelta(days=1)
+        return out
+
+    def test_halves_are_disjoint_and_complete(self):
+        import signal_lab as sl
+        bars = self._bars()
+        first = {b["dt"].date() for b in sl.slice_sessions(bars, first_fraction=0.5)}
+        second = {b["dt"].date() for b in sl.slice_sessions(bars, first_fraction=-0.5)}
+        alld = {b["dt"].date() for b in bars}
+        self.assertFalse(first & second, "halves overlap — not out of sample")
+        self.assertEqual(first | second, alld)
+
+    def test_last_n_takes_the_most_recent(self):
+        import signal_lab as sl
+        bars = self._bars()
+        days = sorted({b["dt"].date() for b in bars})
+        recent = sorted({b["dt"].date() for b in sl.slice_sessions(bars, last_n=20)})
+        self.assertEqual(len(recent), 20)
+        self.assertEqual(recent[-1], days[-1])
+
+    def test_date_range_filter(self):
+        import signal_lab as sl
+        bars = self._bars()
+        sub = sl.slice_sessions(bars, since="2026-03-01", until="2026-03-31")
+        for b in sub:
+            self.assertTrue("2026-03-01" <= str(b["dt"].date()) <= "2026-03-31")
+
+    def test_empty_input_is_safe(self):
+        import signal_lab as sl
+        self.assertEqual(sl.slice_sessions([], last_n=10), [])
+
+
 if __name__ == "__main__":
     unittest.main()
