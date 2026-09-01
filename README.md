@@ -53,6 +53,7 @@ python3 -m unittest test_suite.py -v
 | `backtest_engine.py` | **Separate.** Replays the live strategy over cached history |
 | `backtest_options.py` | Black-Scholes ATM pricing + Angel One cost model |
 | `backtest_data.py` | Candle fetch + CSV cache |
+| `trade_analysis.py` | **Separate.** Index excursion per trade: signal failure vs exit failure |
 | `telegram_notifier.py` | **Separate process.** Telegram alerts + remote status. Touches no trading file. |
 | `config.py` | All live knobs |
 
@@ -320,6 +321,35 @@ daily entry count against the per-index cap.
 
 Both are populated only for trades opened after the instrumentation landed;
 older rows have no `dte` / `max_favorable_price` and are excluded.
+
+---
+
+## Index excursion (`trade_analysis.py`)
+
+Trade rows record what the *option* did, not what the *index* did — so the key
+post-mortem question was unanswerable: when a trade lost, was the **signal**
+wrong (index never moved our way) or the **exit** wrong (index moved our way and
+we still lost, to theta or a tight stop)?
+
+```bash
+python3 trade_analysis.py --backfill      # fill index_* columns from the candle cache
+python3 trade_analysis.py --report --days 7
+```
+
+Backfills `index_at_entry / index_high / index_low / index_at_exit`,
+`index_mfe_pct`, `index_mae_pct` and a verdict per trade:
+
+| Verdict | Meaning |
+|---------|---------|
+| `WIN` | Profitable, index moved our way |
+| `WIN_NO_INDEX_MOVE` | Profitable without a real index move — likely noise |
+| `EXIT_WRONG` | **Lost while the index moved our way.** Exit problem. |
+| `SIGNAL_WRONG` | Lost, index never moved our way. Signal problem. |
+
+Post-hoc by design: it touches no trading file (safe during a frozen config
+window), candle OHLC already carries the true intra-bar extremes so 5-min bars
+give what a tick tracker would, and it works retroactively on closed trades.
+Needs the candle cache current — run `backtest_data.py` after the session.
 
 ---
 

@@ -1374,5 +1374,104 @@ class BacktestEngineTests(unittest.TestCase):
         self.assertEqual(bt.dte_for("NIFTY"), 0)          # expiry day
 
 
+class IndexExcursionTests(unittest.TestCase):
+    """Index excursion decides whether a loss was a signal failure or an exit
+    failure, so the sign convention and the classifier have to be exact."""
+
+    def test_call_and_put_excursions_invert(self):
+        import trade_analysis as ta
+        ext = {"open": 24000.0, "high": 24120.0, "low": 23940.0, "close": 24000.0, "bars": 5}
+        mfe_c, mae_c = ta.excursions(ext, call=True)
+        self.assertAlmostEqual(mfe_c, 0.5, places=4)     # +120 pts is favourable
+        self.assertAlmostEqual(mae_c, -0.25, places=4)   # -60 pts is adverse
+        mfe_p, mae_p = ta.excursions(ext, call=False)
+        self.assertAlmostEqual(mfe_p, 0.25, places=4)    # a falling index helps a put
+        self.assertAlmostEqual(mae_p, -0.5, places=4)
+
+    def test_classifier_separates_exit_failure_from_signal_failure(self):
+        import trade_analysis as ta
+        self.assertEqual(ta.classify(-100, 0.40, -0.20), "EXIT_WRONG")
+        self.assertEqual(ta.classify(-100, 0.02, -0.30), "SIGNAL_WRONG")
+        self.assertEqual(ta.classify(250, 0.40, -0.05), "WIN")
+        self.assertEqual(ta.classify(250, 0.01, -0.05), "WIN_NO_INDEX_MOVE")
+
+    def test_extremes_use_bar_high_low_not_close(self):
+        import trade_analysis as ta
+        from datetime import datetime
+        bars = [
+            {"dt": datetime(2026, 9, 1, 10, 0), "open": 100.0, "high": 105.0, "low": 99.0, "close": 101.0},
+            {"dt": datetime(2026, 9, 1, 10, 5), "open": 101.0, "high": 103.0, "low": 96.0, "close": 100.0},
+        ]
+        ext = ta.window_extremes(bars, datetime(2026, 9, 1, 10, 0), datetime(2026, 9, 1, 10, 5))
+        self.assertEqual(ext["high"], 105.0)   # not max(close)
+        self.assertEqual(ext["low"], 96.0)     # not min(close)
+
+    def test_symbol_direction(self):
+        import trade_analysis as ta
+        self.assertTrue(ta.is_call("NIFTY01SEP2624100CE"))
+        self.assertFalse(ta.is_call("SENSEX2690376900PE"))
+
+    def test_ensure_columns_is_idempotent(self):
+        import trade_analysis as ta
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            DatabaseManager(path)
+            first = ta.ensure_columns(path)
+            self.assertTrue(first)
+            self.assertEqual(ta.ensure_columns(path), [])   # second run adds nothing
+        finally:
+            os.remove(path)
+
+    def test_backfill_end_to_end(self):
+        import sqlite3
+        from datetime import datetime, timedelta
+        import backtest_data as bd
+        import trade_analysis as ta
+
+        original = bd.CACHE_DIR
+        cache = tempfile.mkdtemp()
+        fd, dbp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            bd.CACHE_DIR = cache
+            cfg = INDICES_CONFIG["NIFTY"]
+            rows, t = {}, datetime(2026, 9, 1, 9, 15)
+            for i in range(60):
+                # 10 pts/bar -> ~0.5% over the holding window, comfortably above
+                # the 0.15% "could have reached the target" threshold.
+                px = 24000.0 + 10 * i
+                rows[t.isoformat()] = {"timestamp": t.isoformat(), "open": px,
+                                       "high": px + 5, "low": px - 5,
+                                       "close": px, "volume": 1000}
+                t += timedelta(minutes=5)
+            bd.save_cache(cfg["exchange"], cfg["index_token"], rows)
+
+            DatabaseManager(dbp)
+            conn = sqlite3.connect(dbp)
+            conn.execute(
+                "INSERT INTO trades (symbol, token, qty, exchange, index_name, entry_price,"
+                " status, exit_price, exit_reason, entry_reason, timestamp, entry_time, exit_time)"
+                " VALUES ('NIFTY01SEP2624100CE','1',65,'NFO','NIFTY',50.0,'CLOSED',45.0,"
+                "'STOP_LOSS_HIT','VOLUME_BREAKOUT','2026-09-01 10:00:00',"
+                "'2026-09-01 10:00:00','2026-09-01 11:00:00')")
+            conn.commit()
+            conn.close()
+
+            filled, skipped = ta.backfill(dbp)
+            self.assertEqual((filled, skipped), (1, 0))
+            db = DatabaseManager(dbp)
+            row = db.fetch_one("SELECT index_mfe_pct, signal_verdict, index_high FROM trades")
+            # Index rose throughout, so a losing CALL is an exit failure.
+            self.assertGreater(row["index_mfe_pct"], 0)
+            self.assertEqual(row["signal_verdict"], "EXIT_WRONG")
+            # Second backfill must not duplicate work.
+            self.assertEqual(ta.backfill(dbp)[0], 0)
+        finally:
+            bd.CACHE_DIR = original
+            shutil.rmtree(cache, ignore_errors=True)
+            os.remove(dbp)
+
+
 if __name__ == "__main__":
     unittest.main()
