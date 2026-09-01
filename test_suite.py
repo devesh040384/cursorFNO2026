@@ -1934,5 +1934,32 @@ class OutOfSampleTests(unittest.TestCase):
         self.assertEqual(sl.slice_sessions([], last_n=10), [])
 
 
+
+class StabilityTests(unittest.TestCase):
+    """A signal can be significant in one period and absent in another. Reading
+    periods in isolation misses that; this is the test that catches it."""
+
+    def test_identical_periods_are_consistent(self):
+        import signal_lab as sl
+        self.assertAlmostEqual(sl.stability_t(-0.01, -3.0, -0.01, -3.0), 0.0, places=9)
+
+    def test_first_hour_halves_are_unstable(self):
+        """Pins the Sep 2026 finding: the effect lives in one half only."""
+        import signal_lab as sl
+        for mean_a, t_a, mean_b, t_b in ((-0.0038, -1.27, -0.0232, -6.91),   # NIFTY 45m
+                                         (+0.0018, 0.65, -0.0211, -6.12)):   # SENSEX 45m
+            self.assertGreater(abs(sl.stability_t(mean_a, t_a, mean_b, t_b)), 1.96)
+
+    def test_a_genuinely_stable_effect_passes(self):
+        import signal_lab as sl
+        # same mean, similar precision in both halves
+        self.assertLess(abs(sl.stability_t(-0.020, -5.0, -0.021, -5.2)), 1.96)
+
+    def test_degenerate_inputs(self):
+        import signal_lab as sl
+        self.assertEqual(sl.stability_t(-0.01, 0.0, -0.02, -3.0), 0.0)
+        self.assertEqual(sl.stability_t(-0.01, -3.0, -0.02, 0.0), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

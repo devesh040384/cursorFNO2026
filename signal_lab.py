@@ -294,6 +294,20 @@ def slice_sessions(bars, since=None, until=None, first_fraction=None, last_n=Non
     return out
 
 
+def stability_t(mean_a, t_a, mean_b, t_b):
+    """Are two periods' means significantly different from each other?
+
+    A signal can be significant in both halves and still be unstable, or -- as
+    with first_hour -- significant in one half and absent in the other. Reading
+    each period in isolation misses that; this is the test that catches it.
+    """
+    if not t_a or not t_b:
+        return 0.0
+    se_a, se_b = abs(mean_a / t_a), abs(mean_b / t_b)
+    denom = math.sqrt(se_a * se_a + se_b * se_b)
+    return (mean_b - mean_a) / denom if denom else 0.0
+
+
 def validate(symbol, name, windows, folds=None):
     """Run one signal across disjoint periods and report each separately."""
     bars, fut = load(symbol)
@@ -374,13 +388,38 @@ def main(argv=None):
             print("  %-18s %5s %-11s %5s %6s %10s %7s"
                   % ("period", "days", "from", "win", "n", "mean fwd%", "t"))
             print("  " + "-" * 72)
+            by_label = {}
             for label, ndays, d0, d1, res in rows:
+                by_label[label] = res
                 for w in args.windows:
                     st = res["windows"].get(w)
                     if not st:
                         continue
                     print("  %-18s %5d %-11s %4dm %6d %+10.4f %7.2f"
                           % (label, ndays, str(d0), w, st["n"], st["mean"], st["t"]))
+                print()
+
+            # The halves are the only genuinely disjoint pair; last-60 and
+            # last-20 overlap the second half and cannot confirm it.
+            a = by_label.get("first half", {}).get("windows", {})
+            b = by_label.get("second half", {}).get("windows", {})
+            if a and b:
+                print("  STABILITY — are the two halves the same effect?")
+                unstable = False
+                for w in args.windows:
+                    sa, sb = a.get(w), b.get(w)
+                    if not sa or not sb:
+                        continue
+                    td = stability_t(sa["mean"], sa["t"], sb["mean"], sb["t"])
+                    flag = "UNSTABLE" if abs(td) > 1.96 else "consistent"
+                    unstable = unstable or abs(td) > 1.96
+                    print("    %4dm  halves differ t=%+6.2f   %s" % (w, td, flag))
+                print()
+                if unstable:
+                    print("    The halves are significantly DIFFERENT from each other.")
+                    print("    That is one effect in one period, not an edge measured twice.")
+                else:
+                    print("    Halves agree — the effect is at least stable across the sample.")
                 print()
         print("  Signs must agree across every period. A flip means the finding")
         print("  was a coincidence of the window it was discovered in.")
