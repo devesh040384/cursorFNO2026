@@ -1473,5 +1473,178 @@ class IndexExcursionTests(unittest.TestCase):
             os.remove(dbp)
 
 
+
+class TimeframeDefaultsTests(unittest.TestCase):
+    """The whole point of the switches is that they are inert until moved.
+    If a default ever changes behaviour, the frozen forward sample is void."""
+
+    def test_defaults_are_current_behaviour(self):
+        import timeframes as tf
+        self.assertEqual(tf.entry_timing(), tf.IMMEDIATE)
+        self.assertEqual(tf.stop_mode(), tf.FIXED_PCT)
+
+    def test_arm_is_a_noop_under_immediate(self):
+        import timeframes as tf
+        book, bars = tf.PendingBook(), tf.MinuteBars()
+        bars.update(600, 24000.0)
+        bars.update(601, 24010.0)
+        self.assertFalse(book.arm("NIFTY", "CE", "VOLUME_BREAKOUT", 24010.0, 601, bars))
+        self.assertEqual(book.pending, {})
+
+    def test_structural_stop_inert_under_fixed_pct(self):
+        import timeframes as tf
+        bars = tf.MinuteBars()
+        bars.update(600, 24000.0)
+        bars.update(601, 24010.0)
+        self.assertIsNone(tf.structural_stop_level(True, bars, 24010.0))
+        self.assertFalse(tf.structural_stop_hit(True, None, 1.0))
+
+
+class MinuteBarTests(unittest.TestCase):
+    def test_bars_roll_on_the_minute_and_track_extremes(self):
+        import timeframes as tf
+        bars = tf.MinuteBars()
+        self.assertIsNone(bars.update(600, 100.0))
+        self.assertIsNone(bars.update(600, 104.0))
+        self.assertIsNone(bars.update(600, 98.0))
+        closed = bars.update(601, 99.0)
+        self.assertIsNotNone(closed)
+        self.assertEqual((closed["open"], closed["high"], closed["low"], closed["close"]),
+                         (100.0, 104.0, 98.0, 98.0))
+
+    def test_ring_buffer_is_bounded(self):
+        import timeframes as tf
+        bars = tf.MinuteBars(max_keep=3)
+        for m in range(10):
+            bars.update(600 + m, 100.0 + m)
+        self.assertEqual(len(bars.closed), 3)
+
+    def test_pivot_side_depends_on_direction(self):
+        import timeframes as tf
+        bars = tf.MinuteBars()
+        bars.update(600, 100.0)
+        bars.update(600, 105.0)
+        bars.update(600, 95.0)
+        bars.update(601, 99.0)
+        self.assertEqual(bars.pivot(is_call=True), 95.0)
+        self.assertEqual(bars.pivot(is_call=False), 105.0)
+
+
+class EntryConfirmationTests(unittest.TestCase):
+    def setUp(self):
+        from config import RISK
+        self._saved = {k: RISK.get(k) for k in
+                       ("entry_timing", "stop_mode", "confirm_window_min", "pullback_pct")}
+
+    def tearDown(self):
+        from config import RISK
+        RISK.update(self._saved)
+
+    def _bars(self):
+        import timeframes as tf
+        bars = tf.MinuteBars()
+        bars.update(600, 24000.0)
+        bars.update(600, 24020.0)
+        bars.update(601, 24010.0)
+        return bars
+
+    def test_continuation_fills_only_on_a_new_extreme(self):
+        from config import RISK
+        import timeframes as tf
+        RISK["entry_timing"] = "continuation"
+        book = tf.PendingBook()
+        self.assertTrue(book.arm("NIFTY", "CE", "VOLUME_BREAKOUT", 24010.0, 601, self._bars()))
+        faded = {"close": 23990.0, "low": 23980.0, "high": 24005.0}
+        self.assertIsNone(book.on_minute_close("NIFTY", faded, 602))
+        self.assertTrue(book.pending)
+        broke_out = {"close": 24030.0, "low": 24005.0, "high": 24035.0}
+        filled = book.on_minute_close("NIFTY", broke_out, 603)
+        self.assertIsNotNone(filled)
+        self.assertEqual(filled.side, "CE")
+        self.assertEqual(book.pending, {})
+
+    def test_continuation_for_a_put_needs_a_new_low(self):
+        from config import RISK
+        import timeframes as tf
+        RISK["entry_timing"] = "continuation"
+        book = tf.PendingBook()
+        book.arm("NIFTY", "PE", "VOLUME_BREAKOUT", 24010.0, 601, self._bars())
+        rallied = {"close": 24050.0, "low": 24040.0, "high": 24060.0}
+        self.assertIsNone(book.on_minute_close("NIFTY", rallied, 602))
+        broke_down = {"close": 23990.0, "low": 23985.0, "high": 24005.0}
+        self.assertIsNotNone(book.on_minute_close("NIFTY", broke_down, 603))
+
+    def test_pending_expires_and_is_dropped(self):
+        from config import RISK
+        import timeframes as tf
+        RISK["entry_timing"] = "continuation"
+        RISK["confirm_window_min"] = 2
+        book = tf.PendingBook()
+        book.arm("NIFTY", "CE", "VOLUME_BREAKOUT", 24010.0, 601, self._bars())
+        flat = {"close": 23990.0, "low": 23980.0, "high": 24000.0}
+        for minute in (602, 603):
+            book.on_minute_close("NIFTY", flat, minute)
+        self.assertTrue(book.pending)
+        book.on_minute_close("NIFTY", flat, 604)
+        self.assertEqual(book.pending, {}, "expired signal was not dropped")
+
+    def test_pullback_fills_on_a_retracement(self):
+        from config import RISK
+        import timeframes as tf
+        RISK["entry_timing"] = "pullback"
+        RISK["pullback_pct"] = 0.10
+        book = tf.PendingBook()
+        book.arm("NIFTY", "CE", "VOLUME_BREAKOUT", 24000.0, 601, self._bars())
+        trigger = book.pending["NIFTY"].trigger
+        self.assertAlmostEqual(trigger, 24000.0 * 0.999, places=4)
+        rose = {"close": 24010.0, "low": 24005.0, "high": 24015.0}
+        self.assertIsNone(book.on_minute_close("NIFTY", rose, 602))
+        dipped = {"close": 23985.0, "low": 23970.0, "high": 24000.0}
+        self.assertIsNotNone(book.on_minute_close("NIFTY", dipped, 603))
+
+    def test_falls_back_to_immediate_without_1m_history(self):
+        from config import RISK
+        import timeframes as tf
+        RISK["entry_timing"] = "continuation"
+        book = tf.PendingBook()
+        self.assertFalse(book.arm("NIFTY", "CE", "VOLUME_BREAKOUT", 24000.0, 601, tf.MinuteBars()))
+
+
+class StructuralStopTests(unittest.TestCase):
+    def setUp(self):
+        from config import RISK
+        self._saved = RISK.get("stop_mode")
+        RISK["stop_mode"] = "structural_1m"
+
+    def tearDown(self):
+        from config import RISK
+        RISK["stop_mode"] = self._saved
+
+    def _bars(self):
+        import timeframes as tf
+        bars = tf.MinuteBars()
+        bars.update(600, 24000.0)
+        bars.update(600, 24020.0)
+        bars.update(601, 24010.0)
+        return bars
+
+    def test_level_and_breach_for_a_call(self):
+        import timeframes as tf
+        level = tf.structural_stop_level(True, self._bars(), 24010.0)
+        self.assertEqual(level, 24000.0)
+        self.assertFalse(tf.structural_stop_hit(True, level, 24005.0))
+        self.assertTrue(tf.structural_stop_hit(True, level, 23999.0))
+
+    def test_level_and_breach_for_a_put(self):
+        import timeframes as tf
+        level = tf.structural_stop_level(False, self._bars(), 24010.0)
+        self.assertEqual(level, 24020.0)
+        self.assertTrue(tf.structural_stop_hit(False, level, 24025.0))
+
+    def test_refuses_a_level_already_breached_at_entry(self):
+        import timeframes as tf
+        self.assertIsNone(tf.structural_stop_level(True, self._bars(), 23990.0))
+
+
 if __name__ == "__main__":
     unittest.main()

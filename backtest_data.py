@@ -19,9 +19,12 @@ from config import INDICES_CONFIG
 from ist_time import IST, ist_now
 
 CACHE_DIR = "backtest_cache"
-# Angel One rejects long ranges for intraday intervals; 30 days is safely inside.
+# Angel One rejects long ranges for intraday intervals. One-minute data is 5x
+# denser, so it needs a shorter window per request than five-minute does.
 CHUNK_DAYS = 30
+CHUNK_DAYS_BY_INTERVAL = {"ONE_MINUTE": 7, "THREE_MINUTE": 15}
 INTERVAL = "FIVE_MINUTE"
+INTERVALS = ("ONE_MINUTE", "THREE_MINUTE", "FIVE_MINUTE", "TEN_MINUTE", "FIFTEEN_MINUTE")
 FIELDS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
@@ -82,6 +85,10 @@ def _fetch_chunk(smart_api, exchange, token, start, end, interval=INTERVAL, retr
     return []
 
 
+def chunk_days(interval):
+    return CHUNK_DAYS_BY_INTERVAL.get(interval, CHUNK_DAYS)
+
+
 def fetch_range(smart_api, exchange, token, days, interval=INTERVAL, pause=1.2):
     """Pull `days` of history in chunks, merging into the cache. Returns row count."""
     rows = load_cache(exchange, token, interval)
@@ -91,8 +98,9 @@ def fetch_range(smart_api, exchange, token, days, interval=INTERVAL, pause=1.2):
 
     cursor = start
     chunks = 0
+    span = chunk_days(interval)
     while cursor < end:
-        stop = min(cursor + timedelta(days=CHUNK_DAYS), end)
+        stop = min(cursor + timedelta(days=span), end)
         for candle in _fetch_chunk(smart_api, exchange, token, cursor, stop, interval):
             try:
                 rows[str(candle[0])] = {
@@ -169,6 +177,10 @@ def main(argv=None):
     parser.add_argument("--days", type=int, default=365, help="history depth (default 365)")
     parser.add_argument("--report", action="store_true", help="only show what is cached")
     parser.add_argument("--indices", nargs="*", help="default: all configured")
+    parser.add_argument("--interval", default=INTERVAL, choices=INTERVALS,
+                        help="candle size (default %s)" % INTERVAL)
+    parser.add_argument("--also-1min", action="store_true",
+                        help="additionally cache ONE_MINUTE bars for entry confirmation")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -191,15 +203,22 @@ def main(argv=None):
         with open("scrip_master.json", "r", encoding="utf-8") as f:
             scrip = json.load(f)
 
+    wanted = [args.interval]
+    if args.also_1min and "ONE_MINUTE" not in wanted:
+        wanted.append("ONE_MINUTE")
+
     for symbol in (args.indices or list(INDICES_CONFIG)):
         cfg = INDICES_CONFIG[symbol]
-        fetch_range(smart_api, cfg["exchange"], cfg["index_token"], args.days)
+        for interval in wanted:
+            # 1-min is only needed on the index: entry confirmation and the
+            # structural stop both read the index, never the option.
+            fetch_range(smart_api, cfg["exchange"], cfg["index_token"], args.days, interval)
         builder = DynamicOptionsChainBuilder(index_name=symbol, smart_api=smart_api)
         builder.load_scrip_master(scrip)
         fut = builder.get_nearest_expiry_future()
         if fut and fut.get("token"):
             # Futures volume drives the RVOL gate, so it must be cached too.
-            fetch_range(smart_api, fut["exchange"], fut["token"], args.days)
+            fetch_range(smart_api, fut["exchange"], fut["token"], args.days, args.interval)
         else:
             logging.error("%s: no future resolved; RVOL gate cannot be replayed", symbol)
 

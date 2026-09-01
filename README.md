@@ -47,6 +47,7 @@ python3 -m unittest test_suite.py -v
 | `database.py` | SQLite `trade_history.db` (WAL) |
 | `scorecard.py` | PnL / win-rate from stored qty |
 | `history_seeder.py` | Seeds 5-min bar history from broker candles at startup |
+| `timeframes.py` | 1-min entry confirmation + structural stops (**inert by default**) |
 | `ist_time.py` | Single source of IST wall-clock (all dates/stamps) |
 | `broker_orders.py` | Confirms real fills from the order book (never assumes) |
 | `broker_health.py` | Session re-auth, log rotation, CRITICAL alerting |
@@ -350,6 +351,46 @@ Post-hoc by design: it touches no trading file (safe during a frozen config
 window), candle OHLC already carries the true intra-bar extremes so 5-min bars
 give what a tick tracker would, and it works retroactively on closed trades.
 Needs the candle cache current — run `backtest_data.py` after the session.
+
+---
+
+## Multi-timeframe (1-minute)
+
+The 5-minute bar stays the signal timeframe. A 1-minute series is used for two
+things, **both off by default**:
+
+| Knob | Default | Alternatives |
+|------|---------|--------------|
+| `entry_timing` | `immediate` | `continuation`, `pullback` |
+| `stop_mode` | `fixed_pct` | `structural_1m` |
+| `confirm_window_min` | `3` | minutes a pending signal waits |
+| `pullback_pct` | `0.15` | retracement required, pullback mode only |
+
+**Entry timing.** A 5-min signal fires at the bar close, which on a vertical move
+is the top of the move. `continuation` holds the signal until the index makes a
+new 1-min extreme in that direction, so a move that peaks and fades is *never
+filled*. `pullback` waits for a retracement instead: a better price, at the risk
+of filling into a move that is already failing.
+
+**Structural stops.** `structural_1m` adds an index-level invalidation — if the
+index breaks the 1-min pivot that defined the setup, exit regardless of premium.
+The fixed premium stop stays as a backstop. Against a +30% target this lifts R:R
+from 3:1 toward 5-7:1, at the cost of more stop-outs; which wins is a backtest
+question, not an argument.
+
+Everything works on the **index**, never the option: the bot subscribes to index
+ticks continuously but never to option ticks, so a 1-min option series does not
+exist before entry.
+
+Cache 1-minute candles with:
+
+```bash
+python3 backtest_data.py --days 30 --also-1min
+```
+
+> **Defaults reproduce today's behaviour exactly, and nothing in the live path
+> reads these yet.** Do not move them off their defaults mid-experiment — they
+> change which trades are taken, so the forward sample restarts.
 
 ---
 

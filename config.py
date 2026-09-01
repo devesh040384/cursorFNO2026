@@ -69,6 +69,25 @@ RISK = {
     # stop with no adverse spot move. Set 1 to skip expiry day, 2 to force the
     # next weekly. Trade-off: higher DTE = lower gamma, so +22% is slower to reach.
     "min_dte": 0,
+    # --- multi-timeframe (1-min) --------------------------------------------
+    # ALL DEFAULTS REPRODUCE TODAY'S BEHAVIOUR EXACTLY. Do not move these off
+    # their defaults mid-experiment: they change which trades are taken, so the
+    # forward sample restarts. Sweep them in the backtest first.
+    #
+    # entry_timing:
+    #   "immediate"    fill on the 5-min bar close (current)
+    #   "continuation" wait for a 1-min close beyond the last 1-min extreme, so
+    #                  a move that peaks and fades is never filled
+    #   "pullback"     wait for a retracement of pullback_pct from the signal
+    #                  close: better price, risks filling into a failing move
+    "entry_timing": "immediate",
+    "confirm_window_min": 3,
+    "pullback_pct": 0.15,
+    # stop_mode:
+    #   "fixed_pct"     trending_sl_mult only (current)
+    #   "structural_1m" additionally exit when the INDEX breaks the 1-min pivot
+    #                   that defined the setup; the premium stop stays as backstop
+    "stop_mode": "fixed_pct",
     "min_option_volume": 500.0,
     # Measured paper edge is ~2.1% of notional. A MARKET round trip pays the
     # spread twice, so a 3% cap let execution cost reach ~2.9x the entire edge.

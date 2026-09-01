@@ -4,6 +4,30 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-01 — Multi-timeframe scaffolding (inert)
+
+- New `timeframes.py`: 1-minute bar aggregation, a pending-entry state machine
+  (`continuation` / `pullback`) and index-based structural stops.
+- New `RISK` knobs — `entry_timing`, `stop_mode`, `confirm_window_min`,
+  `pullback_pct` — whose **defaults reproduce current behaviour exactly**.
+  Nothing in the live path reads them yet.
+- `backtest_data.py` gains `--interval` and `--also-1min`. One-minute data is 5x
+  denser, so it chunks at 7 days per request instead of 30.
+
+**Design note:** the 1-minute timeframe reads the **index**, never the option.
+The bot subscribes to index ticks continuously but never to option ticks, so a
+1-minute option series does not exist before entry — and the index is the signal
+source anyway.
+
+**Why continuation over pullback:** on all three "missed move" charts from Aug 31
+and Sep 1, price peaked *at* the volume spike and faded. Pullback would have
+filled into every one of those fades; continuation never gets a new extreme, so
+it declines to fill. That said, 7 of 10 Sep 1 entries already went favourable
+before reversing, so entry price is not the main leak — the structural stop is
+the larger lever, and both need sweeping before either goes live.
+
+---
+
 ## 2026-09-01 — Index excursion analysis
 
 - New `trade_analysis.py` backfills, per closed trade, where the **index** went
