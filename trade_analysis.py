@@ -42,7 +42,16 @@ COLUMNS = {
     "index_mfe_pct": "REAL",   # best favourable index move, signed for direction
     "index_mae_pct": "REAL",   # worst adverse index move
     "signal_verdict": "TEXT",  # see classify()
+    # Forward excursion: measured from entry over a FIXED window, ignoring when
+    # we actually exited. Holding-window MFE cannot distinguish "the signal was
+    # wrong" from "we exited before the move arrived" -- a 1.6-minute hold has
+    # no chance to show a 0.15% move even if one landed at minute 10.
+    "fwd_mfe_15m": "REAL",
+    "fwd_mfe_30m": "REAL",
+    "fwd_mfe_45m": "REAL",
 }
+
+FORWARD_WINDOWS = (15, 30, 45)
 
 
 def ensure_columns(db_path=DB_FILE):
@@ -93,6 +102,27 @@ def window_extremes(bars, start, end):
         "close": window[-1]["close"],
         "bars": len(window),
     }
+
+
+def forward_excursion(bars, start, minutes, call):
+    """Best favourable index move within `minutes` of entry, however long we held.
+
+    This is the test that separates a dead signal from a stop that is too tight:
+    if the move shows up at minute 20 but we were stopped out at minute 4, the
+    signal worked and the exit did not.
+    """
+    if not bars or start is None:
+        return None
+    end = start + timedelta(minutes=minutes)
+    window = [b for b in bars if start - timedelta(minutes=5) < b["dt"] <= end]
+    if not window:
+        return None
+    entry = float(window[0]["open"])
+    if entry <= 0:
+        return None
+    if call:
+        return 100.0 * (max(b["high"] for b in window) - entry) / entry
+    return 100.0 * (entry - min(b["low"] for b in window)) / entry
 
 
 def excursions(extremes, call):
@@ -180,12 +210,13 @@ def backfill(db_path=DB_FILE, only_missing=True):
                 mfe, mae = excursions(ext, call)
                 qty = int(t["qty"] or 0)
                 pnl = ((t["exit_price"] or 0) - (t["entry_price"] or 0)) * qty
+                fwd = [forward_excursion(bars, start, m, call) for m in FORWARD_WINDOWS]
                 conn.execute(
                     "UPDATE trades SET index_at_entry=?, index_high=?, index_low=?,"
-                    " index_at_exit=?, index_mfe_pct=?, index_mae_pct=?, signal_verdict=?"
-                    " WHERE id=?",
+                    " index_at_exit=?, index_mfe_pct=?, index_mae_pct=?, signal_verdict=?,"
+                    " fwd_mfe_15m=?, fwd_mfe_30m=?, fwd_mfe_45m=? WHERE id=?",
                     (ext["open"], ext["high"], ext["low"], ext["close"],
-                     mfe, mae, classify(pnl, mfe, mae), t["id"]),
+                     mfe, mae, classify(pnl, mfe, mae), fwd[0], fwd[1], fwd[2], t["id"]),
                 )
                 filled += 1
         conn.commit()
@@ -200,7 +231,7 @@ def report(db_path=DB_FILE, days=7):
     rows = db.fetch_all(
         "SELECT id, symbol, index_name, entry_reason, exit_reason, entry_price, exit_price,"
         " qty, index_at_entry, index_high, index_low, index_mfe_pct, index_mae_pct,"
-        " signal_verdict, entry_time FROM trades"
+        " signal_verdict, entry_time, fwd_mfe_15m, fwd_mfe_30m, fwd_mfe_45m FROM trades"
         " WHERE status='CLOSED' AND index_at_entry IS NOT NULL"
         " AND substr(COALESCE(entry_time, timestamp,''),1,10) >= ? ORDER BY id",
         (str(since),),
@@ -231,6 +262,24 @@ def report(db_path=DB_FILE, days=7):
             r["id"], r["index_name"] or "?", r["entry_reason"] or "?",
             (r["exit_reason"] or "?")[:9], pnl,
             r["index_mfe_pct"] or 0.0, r["index_mae_pct"] or 0.0))
+
+    have_fwd = [r for r in rows if r["fwd_mfe_30m"] is not None]
+    if have_fwd:
+        lines += ["", "  FORWARD INDEX MOVE FROM ENTRY (ignores when we exited)"]
+        held_key = "index_mfe_pct"
+        lines.append("    %-14s %s" % ("window", "share of trades reaching a tradeable move"))
+        for label, key in (("held only", held_key), ("15 min", "fwd_mfe_15m"),
+                           ("30 min", "fwd_mfe_30m"), ("45 min", "fwd_mfe_45m")):
+            vals = [r[key] for r in have_fwd if r[key] is not None]
+            if not vals:
+                continue
+            reach = 100.0 * sum(1 for v in vals if v >= 0.15) / len(vals)
+            lines.append("    %-14s %5.1f%%  (median %.3f%%)"
+                         % (label, reach, sorted(vals)[len(vals) // 2]))
+        lines += ["",
+                  "    If the longer windows reach far more often than 'held only',",
+                  "    the signal works and the stop is cutting it off. If they do not,",
+                  "    the signal does not predict movement."]
 
     losses = [r for r in rows if ((r["exit_price"] or 0) - (r["entry_price"] or 0)) < 0]
     if losses:
