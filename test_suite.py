@@ -1716,5 +1716,64 @@ class NiftySeedingTests(unittest.TestCase):
         self.assertIn("NO ENTRIES", joined)
 
 
+
+class ForwardExcursionTests(unittest.TestCase):
+    """Held-window MFE cannot tell a dead signal from a stop that fired too
+    early. The forward window is the measurement that can."""
+
+    def _bars(self, flat_bars=12, move_bars=8, step=20.0):
+        from datetime import datetime, timedelta
+        bars, t, px = [], datetime(2026, 9, 1, 9, 15), 24000.0
+        for i in range(75):
+            if flat_bars <= i < flat_bars + move_bars:
+                px += step
+            bars.append({"dt": t, "open": px, "high": px + 2, "low": px - 2, "close": px})
+            t += timedelta(minutes=5)
+        return bars
+
+    def test_forward_window_sees_a_move_the_holding_window_missed(self):
+        from datetime import datetime
+        import trade_analysis as ta
+        bars = self._bars()
+        entry = datetime(2026, 9, 1, 10, 15)
+        held = ta.window_extremes(bars, entry, datetime(2026, 9, 1, 10, 19))
+        held_mfe, _ = ta.excursions(held, call=True)
+        fwd30 = ta.forward_excursion(bars, entry, 30, call=True)
+        self.assertLess(held_mfe, 0.15)      # a 4-minute hold sees nothing
+        self.assertGreater(fwd30, held_mfe * 3)
+
+    def test_forward_windows_are_monotonic(self):
+        from datetime import datetime
+        import trade_analysis as ta
+        bars = self._bars()
+        entry = datetime(2026, 9, 1, 10, 15)
+        vals = [ta.forward_excursion(bars, entry, m, call=True) for m in (15, 30, 45)]
+        self.assertEqual(vals, sorted(vals))
+
+    def test_put_direction_inverts(self):
+        from datetime import datetime
+        import trade_analysis as ta
+        rising = self._bars()
+        entry = datetime(2026, 9, 1, 10, 15)
+        self.assertGreater(ta.forward_excursion(rising, entry, 30, call=True), 0)
+        # A rising index is adverse for a put. The entry bar's own low sits just
+        # below its open, so a tiny favourable excursion is real, not a bug --
+        # it just must be far below the 0.15% tradeable threshold.
+        self.assertLess(ta.forward_excursion(rising, entry, 30, call=False), 0.05)
+
+    def test_flat_index_yields_no_forward_move(self):
+        from datetime import datetime
+        import trade_analysis as ta
+        flat = self._bars(flat_bars=75, move_bars=0)
+        val = ta.forward_excursion(flat, datetime(2026, 9, 1, 10, 15), 45, call=True)
+        self.assertLess(abs(val), 0.05)
+
+    def test_missing_bars_return_none(self):
+        from datetime import datetime
+        import trade_analysis as ta
+        self.assertIsNone(ta.forward_excursion([], datetime(2026, 9, 1, 10, 15), 30, True))
+        self.assertIsNone(ta.forward_excursion(self._bars(), None, 30, True))
+
+
 if __name__ == "__main__":
     unittest.main()
