@@ -80,6 +80,7 @@ python3 -m unittest test_suite.py -v
 | `backtest_engine.py` | **Separate.** Replays the live strategy over cached history |
 | `backtest_options.py` | Black-Scholes ATM pricing + Angel One cost model |
 | `backtest_data.py` | Candle fetch + CSV cache |
+| `oi_collector.py` | **Separate process.** Option-chain snapshots for positioning research |
 | `signal_lab.py` | **Screens signal hypotheses on index data — no options, no costs**; `--validate` for out-of-sample |
 | `trade_analysis.py` | **Separate.** Index excursion per trade: signal failure vs exit failure |
 | `telegram_notifier.py` | **Separate process.** Telegram alerts + remote status. Touches no trading file. |
@@ -458,6 +459,42 @@ python3 backtest_data.py --days 30 --also-1min
 > **Defaults reproduce today's behaviour exactly, and nothing in the live path
 > reads these yet.** Do not move them off their defaults mid-experiment — they
 > change which trades are taken, so the forward sample restarts.
+
+---
+
+## Options positioning (`oi_collector.py`)
+
+Six price/volume signals came back null, so the next hypothesis uses genuinely
+different information: **where market makers are forced to hedge.** Change in
+open interest, gamma walls, PCR momentum.
+
+> **This cannot be backtested.** `getCandleData` returns OHLCV with **no open
+> interest**, and expired contracts are delisted, so no chain history is
+> retrievable at any price. Unlike the price signals — screened over 248 cached
+> sessions in an afternoon — OI has to be **collected forward first**. There is
+> no shortcut.
+
+```bash
+python3 oi_collector.py --once      # one snapshot; verify the OI field resolves
+python3 oi_collector.py             # run alongside the bot, own tmux window
+python3 oi_collector.py --report    # sessions collected so far
+```
+
+Snapshots ATM ±5 strikes of the nearest expiry, both CE and PE, every 3 minutes
+(~125 snapshots/session, ~0.011 API calls/sec — negligible beside the bot).
+
+**Design rule: store raw, derive later.** No COI deltas, PCR or gamma walls are
+computed at capture. Those definitions *will* change — which window, which
+strikes, OI-PCR or volume-PCR — and a premature aggregation would destroy the
+data needed to test the next version. The screen computes metrics from the raw
+table.
+
+Missing OI is stored as `NULL`, never `0`: a zero looks like real data later.
+The full response is kept in `raw` so a field-name change is recoverable.
+
+**Timeline:** ~40 sessions for a first read, roughly double for an out-of-sample
+split. That is 2–4 months of collection before any verdict — start now, and
+treat it as running in the background rather than as active work.
 
 ---
 
