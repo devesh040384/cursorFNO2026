@@ -2048,5 +2048,57 @@ class EntryRaceTests(unittest.TestCase):
         self.assertEqual(len(om.calls), 2)
 
 
+
+class StateFileTests(unittest.TestCase):
+    """rsi_state.json is written from the websocket callback thread. Unlocked
+    open("w") writers spliced into each other, producing the
+    'Extra data: line 1 column 2034' seen on 2026-09-03."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.brain = StrategyBrain(order_engine=None, options_builders={})
+        self.brain.state_file = os.path.join(self.dir, "rsi_state.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_concurrent_saves_never_corrupt_the_file(self):
+        import json
+
+        def hammer(n):
+            self.brain.price_histories["NIFTY"] = [24000.0 + i for i in range(n)]
+            for _ in range(30):
+                self.brain._save_state()
+
+        threads = [threading.Thread(target=hammer, args=(n,)) for n in (400, 1, 200, 5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        with io.open(self.brain.state_file, encoding="utf-8") as f:
+            json.load(f)                      # raises if spliced
+
+    def test_no_temp_file_is_left_behind(self):
+        self.brain._save_state()
+        self.assertFalse(os.path.exists(self.brain.state_file + ".tmp"))
+
+    def test_corrupt_state_is_quarantined_not_reread(self):
+        with io.open(self.brain.state_file, "w", encoding="utf-8") as f:
+            f.write('{"date": "x"}{"date": "y"}')     # the exact failure shape
+        self.brain._load_state()
+        self.assertTrue(os.path.exists(self.brain.state_file + ".corrupt"),
+                        "corrupt file was not quarantined and will fail again")
+        self.assertFalse(os.path.exists(self.brain.state_file))
+
+    def test_round_trip_survives_a_save(self):
+        import json
+        self.brain.price_histories["NIFTY"] = [1.0, 2.0, 3.0]
+        self.brain._save_state()
+        with io.open(self.brain.state_file, encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertEqual(state["price_histories"]["NIFTY"], [1.0, 2.0, 3.0])
+        self.assertIn("signal_bar_sec", state)
+
+
 if __name__ == "__main__":
     unittest.main()
