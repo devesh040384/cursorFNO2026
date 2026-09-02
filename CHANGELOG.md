@@ -562,25 +562,39 @@ expansion windows sit inside it.
 
 | Area | Status |
 |------|--------|
+| **Strategy** | **Does not work — see the top of the README. Paper only.** |
 | Indices | NIFTY + SENSEX |
-| Paper mode | Default ON |
-| Signal bar | 5-min IST |
-| Warmup | **Seeded from broker 5-min candles at startup** (entries live from 09:45) |
-| Exit monitors | Tick / ~5s |
+| Signal bar | 5-min IST; 1-min scaffolding present but inert |
+| Warmup | Seeded from broker candles (computed window, rate-limit aware) |
 | Entries | VOLUME_BREAKOUT → TREND_CONT / RSI_HOOK |
-| Choppy extreme RSI | OFF |
-| Volume gate | Futures RVOL, sticky hold, tick dedupe, partial/gap bars discarded |
-| Liquidity | Volume + real depth spread, cap **1.5%** (no fake 2%) |
-| Contract | ATM, `min_dte = 0` (0-DTE allowed); expiry/DTE recorded per trade |
-| Target / SL | **+30% / −10%** (3:1) |
-| Trail | 5-tier ladder: +4% BE, +8% ×1.02, +15% 50% peak, +22% 65%, +26% 75% |
-| Risk | Loss/streak halt, open caps, paper 12 / live 4 daily, **per-index 6/3**, trend soft-cap 4 |
-| Session | 09:45–14:30 entries; 15:15 EOD |
-| Timezone | All wall-clock via `ist_time.py` (host-local never used) |
-| Scorecard | From 2026-08-21; adds `by DTE` + runner capture |
+| Target / SL | +30% / −10% (3:1) |
+| Trail | 5 tiers: +4% BE, +8% ×1.02, +15% 50% peak, +22% 65%, +26% 75% |
+| Risk | Loss/streak halt, per-index 6/3 daily, trend soft-cap 4 |
+| Concurrency | `ENTRY_LOCK` + per-bar dedupe; `STATE_LOCK` + atomic state write |
 | Execution | Fills confirmed via order book; slippage + spread recorded |
-| Session | Auto re-auth on token expiry; rotating logs; optional webhook alerts |
-| Tests | 48 in `test_suite.py` |
+| Session | 09:45–14:30 entries; 15:15 EOD |
+| Timezone | All wall-clock via `ist_time.py` |
+| Research | `backtest_engine`, `signal_lab` (+`--validate`), `trade_analysis` |
+| Tests | 142 in `test_suite.py` |
+
+---
+
+## Verdict (2026-09-03)
+
+Four independent methods agree `VOLUME_BREAKOUT` has no edge. Two of them use no
+option model, so the conclusion does not rest on the synthetic pricing:
+
+| Method | Result |
+|--------|--------|
+| Backtest, 1,146 trades | expectancy −₹88/trade, **t = −6.5** |
+| Live index excursion, 30 trades | median move after a signal **0.08%** |
+| Forward excursion vs random walk | **below diffusion** at every window |
+| Signal screen, 248 sessions | below the corrected bar; no cross-index replication |
+
+It loses **before costs** (−₹30.7/trade gross). The one candidate that looked
+real, `first_hour` inverted, **failed out-of-sample**.
+
+Go-live is off. The infrastructure stands; the signal does not.
 
 ---
 
