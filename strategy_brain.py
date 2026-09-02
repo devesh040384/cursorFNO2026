@@ -15,6 +15,13 @@ from indicators import wilder_rsi, volume_expanded
 # is double the intended risk on a cap of one.
 ENTRY_LOCK = threading.Lock()
 
+# rsi_state.json is written from the same websocket callback thread. Two threads
+# both open("w"), both truncate, and the shorter write lands inside the longer
+# one -- which is the "Extra data: line 1 column 2034" seen on 2026-09-03.
+# The lock serialises writers; the temp-file swap means a reader (or a crash)
+# never sees a half-written file.
+STATE_LOCK = threading.Lock()
+
 # Upper bound on the entry pause after a feed gap: EMA21 needs ~21 clean bars,
 # but pausing longer than that just wastes the session.
 MAX_STALE_BARS = 22
@@ -292,27 +299,52 @@ class StrategyBrain:
         return ema
 
     def _save_state(self):
-        try:
-            today_str = ist_today()
-            with open(self.state_file, "w") as f:
-                json.dump({
-                    "date": today_str,
-                    "price_histories": self.price_histories,
-                    "last_closed_rsi": self.last_closed_rsi,
-                    "last_candle_times": self.last_candle_times,
-                    "closed_rsi": self.closed_rsi,
-                    "signal_bar_sec": signal_bar_sec(),
-                }, f)
-        except Exception as e:
-            logging.error(f"❌ Error saving StrategyBrain state: {e}")
+        payload = {
+            "date": ist_today(),
+            "price_histories": self.price_histories,
+            "last_closed_rsi": self.last_closed_rsi,
+            "last_candle_times": self.last_candle_times,
+            "closed_rsi": self.closed_rsi,
+            "signal_bar_sec": signal_bar_sec(),
+        }
+        tmp = self.state_file + ".tmp"
+        with STATE_LOCK:
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(payload, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                # Atomic on POSIX and Windows: the state file is either the old
+                # one or the new one, never a splice of both.
+                os.replace(tmp, self.state_file)
+            except Exception as e:
+                logging.error(f"❌ Error saving StrategyBrain state: {e}")
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
 
     def _load_state(self):
         if not os.path.exists(self.state_file):
             return
         try:
             today_str = ist_today()
-            with open(self.state_file, "r") as f:
-                state = json.load(f)
+            with STATE_LOCK:
+                with open(self.state_file, "r") as f:
+                    state = json.load(f)
+        except ValueError as e:
+            # A corrupt file must not survive to fail again every restart.
+            logging.error(
+                f"❌ rsi_state.json is unreadable ({e}); discarding it. "
+                "Seeding will rebuild history."
+            )
+            try:
+                os.replace(self.state_file, self.state_file + ".corrupt")
+            except OSError:
+                pass
+            return
+        try:
             if state.get("date", "") != today_str:
                 return
             # Drop histories built on a different / unknown bar size (e.g. old 1-min state).

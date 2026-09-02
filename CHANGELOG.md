@@ -4,6 +4,31 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-03 — Atomic state file (same root cause as the entry race)
+
+`❌ Error loading StrategyBrain state: Extra data: line 1 column 2034` — a JSON
+splice, not a truncation. `_save_state` runs on the websocket callback thread and
+used a bare `open("w")` with no lock, so two writers both truncated and the
+shorter write landed inside the longer one.
+
+Reproduced in 60 attempts, then fixed two ways:
+
+- `STATE_LOCK` serialises writers.
+- The write goes to `rsi_state.json.tmp` and is `os.replace`d into position —
+  atomic on POSIX and Windows — so a reader or a crash never sees half a file.
+
+A corrupt file is now moved to `.corrupt` on load rather than left to fail on
+every restart, and seeding rebuilds the history anyway.
+
+**This is the third instance of the same root cause in two days:** duplicate
+entries (unlocked check-then-act on the DB), and now spliced state writes.
+Anything touched from the websocket callback thread needs the same scrutiny.
+
+**Live impact was small.** State failed to load, so the bot started cold — and
+seeding covers exactly that. It would have mattered more before the seeding fix.
+
+---
+
 ## 2026-09-03 — Duplicate-entry race + seeding rate limits (LIVE)
 
 **Duplicate positions (serious).** Trades 136 and 137 on 2026-09-02 are the same
