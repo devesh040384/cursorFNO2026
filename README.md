@@ -319,6 +319,10 @@ fact, so anything reached from a tick handler needs the same scrutiny:
 | Two identical SENSEX positions at the same second, against a cap of 1 | `assess_order_safety` read the DB, `log_trade` wrote it, nothing held between | `ENTRY_LOCK` across check-and-write, **plus** one entry per index per signal bar |
 | `rsi_state.json` spliced: *Extra data: line 1 column 2034* | two `open("w")` writers truncating over each other | `STATE_LOCK`, **plus** write-to-temp and `os.replace` so a crash cannot splice |
 | Volume bars double-counted | duplicate ticks | dedupe on `sequence_number`, else `(volume_today, last_qty)` |
+| **Two broker SELLs on one trade** (live only) | TSL (5s) and EOD (10s) loops both scan `OPEN`; the SELL is sent *before* `close_trade` is consulted, so its `AND status='OPEN'` guard protects the DB, not the broker | `claim_for_exit` moves `OPEN → EXITING` atomically **before** any order; `release_claim` on every failure path |
+
+A claimed row still counts toward the open-position caps — otherwise claiming
+one would free a slot and admit a new entry against a position not yet gone.
 
 Each has two guards deliberately. A lock does not survive a kill signal
 mid-write; an atomic swap does not stop two threads both deciding to trade.
@@ -515,6 +519,29 @@ The entire effect lives in the second half, SENSEX flips sign in the first, and
 the recent period is null. A regime artifact, not an edge.
 
 `--since` / `--until` screen a specific window directly.
+
+### Judging an edge against an instrument
+
+```bash
+python3 signal_lab.py --instrument future --hold 45
+```
+
+A signal is only useful if its edge clears the cost of the instrument used to
+express it. Comparing round-trip cost percentages across instruments is
+meaningless without dividing by leverage — options are ~116× levered, which very
+nearly cancels their much larger percentage cost:
+
+| hold | option | future | wins |
+|------|--------|--------|------|
+| 5 min | 0.0154% | 0.0350% | option |
+| 30 min | 0.0301% | 0.0350% | option |
+| 45 min | 0.0389% | 0.0350% | **future** |
+| 120 min | 0.0831% | 0.0350% | **future** |
+
+**The instrument is not the problem — theta is, and only past ~20 minutes.**
+Every screened signal falls short on both: `first_hour` inverted by 2.4×,
+`ema_trend` by 3.9×, `volume_breakout` by 4.9×. Moving to futures would not have
+rescued them.
 
 ---
 

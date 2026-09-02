@@ -64,6 +64,54 @@ def _norm_sf(z):
     return 0.5 * math.erfc(z / math.sqrt(2.0))
 
 
+# ------------------------------------------------------------------- economics
+# A signal is only useful if its edge clears the cost of the instrument used to
+# express it. The same index move that is worthless in ATM options can be
+# comfortably profitable in futures, because the hurdle differs by ~15x.
+
+INSTRUMENTS = {
+    # cost_pct is the round-trip cost as a percentage of NOTIONAL.
+    # leverage converts an index % move into an instrument % move.
+    "option": {
+        # 0.21% observed spread crossed twice, plus ~1.02% brokerage/STT/GST on a
+        # ~Rs6,000 notional where the flat Rs40 dominates.
+        "cost_pct": 1.44,
+        "leverage": 116.0,      # measured on ATM 1-DTE: +0.5% index -> +58% premium
+        "theta_pct_per_hour": 4.1,
+        "lot_margin": {"NIFTY": 6500.0, "SENSEX": 6000.0},
+        "label": "ATM option (buy)",
+    },
+    "future": {
+        # Measured on one NIFTY lot (notional ~Rs15.6L): Rs40 brokerage + Rs312
+        # STT + Rs59 exchange + GST + stamp = ~Rs460 = 0.0295%. Spread is a tick
+        # or two on top. No decay.
+        "cost_pct": 0.035,
+        "leverage": 1.0,
+        "theta_pct_per_hour": 0.0,
+        "lot_margin": {"NIFTY": 175000.0, "SENSEX": 160000.0},
+        "label": "index future",
+    },
+}
+
+
+def net_edge_pct(index_move_pct, instrument="option", hold_minutes=0.0):
+    """Instrument-level return after costs, for a given index move.
+
+    Returns (gross %, cost %, net %) of the instrument's own notional.
+    """
+    spec = INSTRUMENTS[instrument]
+    gross = index_move_pct * spec["leverage"]
+    cost = spec["cost_pct"] + spec["theta_pct_per_hour"] * (hold_minutes / 60.0)
+    return gross, cost, gross - cost
+
+
+def required_index_move_pct(instrument="option", hold_minutes=0.0):
+    """Smallest index move that breaks even on this instrument."""
+    spec = INSTRUMENTS[instrument]
+    cost = spec["cost_pct"] + spec["theta_pct_per_hour"] * (hold_minutes / 60.0)
+    return cost / spec["leverage"]
+
+
 # --------------------------------------------------------------------- signals
 # Each takes (bars, i, fut) and returns "CE", "PE" or None for the bar at i.
 # `fut` is the aligned futures series (for volume), or None.
@@ -357,6 +405,10 @@ def main(argv=None):
     parser.add_argument("--index", default=None, help="default: every configured index")
     parser.add_argument("--signals", nargs="*", help="default: all")
     parser.add_argument("--windows", nargs="*", type=int, default=list(DEFAULT_WINDOWS))
+    parser.add_argument("--instrument", default="option", choices=sorted(INSTRUMENTS),
+                        help="cost model to judge the edge against (default option)")
+    parser.add_argument("--hold", type=float, default=30.0,
+                        help="assumed hold in minutes, for theta (default 30)")
     parser.add_argument("--validate", metavar="SIGNAL",
                         help="out-of-sample check: run one signal across disjoint periods")
     parser.add_argument("--since", metavar="YYYY-MM-DD")
@@ -443,6 +495,12 @@ def main(argv=None):
               % (symbol, len(bars), len(bd.group_by_session(bars))))
         print("  significance bar: |t| > %.2f raw, > %.2f after correcting for %d tests"
               % (bar, corrected, tests))
+        spec = INSTRUMENTS[args.instrument]
+        hurdle = required_index_move_pct(args.instrument, args.hold)
+        print("  instrument: %s  |  round-trip cost %.2f%% + theta %.1f%%/h"
+              % (spec["label"], spec["cost_pct"], spec["theta_pct_per_hour"]))
+        print("  break-even index move over a %.0f-min hold: %.4f%%"
+              % (args.hold, hurdle))
         print("=" * 78)
         print("  %-16s %6s %5s %10s %7s %8s %8s" %
               ("signal", "n", "win", "mean fwd%", "t", "reach%", "medMFE%"))
@@ -469,6 +527,8 @@ def main(argv=None):
                     flag = "  <== beats corrected bar"
                 elif abs(s["t"]) > bar:
                     flag = "  (raw only)"
+                if abs(s["mean"]) >= hurdle:
+                    flag += "  [clears cost]"
                 print("  %-16s %6d %5dm %+10.4f %7.2f %8.1f %8.3f%s"
                       % (name, s["n"], w, s["mean"], s["t"], s["reach"], s["median_mfe"], flag))
     print("\n  mean fwd%% is the SIGNED index move in the signal's own direction.")

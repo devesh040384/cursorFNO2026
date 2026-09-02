@@ -13,6 +13,11 @@ class OrderExecutionEngine:
         self.scrip_master = scrip_master
         self.paper_trading = paper_trading
 
+    def _release(self, trade_id):
+        """Hand a claimed row back so a later pass can retry the exit."""
+        if trade_id is not None and self.db_manager:
+            self.db_manager.release_claim(trade_id)
+
     def _fetch_ltp(self, exchange, symbol, token, fallback=0.0):
         if not self.smart_api or not token:
             return float(fallback or 0.0)
@@ -155,6 +160,15 @@ class OrderExecutionEngine:
             logging.error(f"❌ Refusing exit for {symbol}: invalid qty {qty}")
             return False
 
+        # Claim the row before anything irreversible. Two monitors scan for OPEN
+        # rows on different intervals and can pick up the same trade; in live
+        # mode each would send its own SELL, leaving a net short position.
+        if trade_id is not None and not self.db_manager.claim_for_exit(trade_id):
+            logging.info(
+                f"[{symbol}] Exit skipped ({reason}): trade #{trade_id} already being closed."
+            )
+            return False
+
         logging.info(
             f"⚙️ EXIT SELL {qty}x {symbol} ({exchange}) | reason={reason} | Paper={self.paper_trading}"
         )
@@ -163,6 +177,7 @@ class OrderExecutionEngine:
             logging.error(
                 f"❌ Refusing exit for {symbol} at ₹{fill_price} ({reason}); leaving OPEN."
             )
+            self._release(trade_id)
             return False
 
         if self.paper_trading:
@@ -175,6 +190,7 @@ class OrderExecutionEngine:
         order_id = self._place_live_order(symbol, token, qty, "SELL", exchange, order_type, fill_price)
         if not order_id:
             logging.error(f"❌ Broker SELL failed for {symbol}; leaving trade #{trade_id} OPEN.")
+            self._release(trade_id)
             return False
 
         fill = confirm_fill(self.smart_api, order_id)
@@ -185,6 +201,7 @@ class OrderExecutionEngine:
                 f"⚠️ [LIVE] SELL {symbol} order {order_id} is {fill.status.upper()}; "
                 f"trade #{trade_id} left OPEN for retry."
             )
+            self._release(trade_id)
             return False
 
         fill_price = fill.avg_price
@@ -193,6 +210,7 @@ class OrderExecutionEngine:
                 f"⚠️ [LIVE] SELL {symbol} partial exit {fill.filled_qty}/{qty}; "
                 f"trade #{trade_id} left OPEN — residual position must be squared manually."
             )
+            self._release(trade_id)
             return False
 
         closed = self.db_manager.close_trade(trade_id, fill_price, reason)

@@ -4,6 +4,46 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-03 — Concurrency audit + instrument cost model
+
+**Audit finding: double-SELL exposure (live only).** The trailing-stop loop (5s)
+and the EOD loop (10s) both scan for `OPEN` rows, so at 15:15 they can pick up
+the same trade. `execute_exit` sends the broker SELL **before** `close_trade` is
+consulted, and `close_trade`'s `AND status = 'OPEN'` guard protects the database,
+not the broker — two callers would send two SELLs and leave a **net short
+position**. Paper mode hid it, because there `close_trade` is the only effect.
+
+Fixed by making the database the arbiter *before* anything irreversible:
+`claim_for_exit` atomically moves `OPEN → EXITING`, and only the winner proceeds.
+Every failure path calls `release_claim` so the trade retries. A claimed row
+still counts as open for risk caps, or a claim would free a slot for a new entry.
+
+That is the fourth bug from one root cause: shared state touched by more than one
+thread without an atomic guard.
+
+**Instrument cost model, and a correction.** I suggested futures would have a
+"~15x lower hurdle" than options. That was wrong: it compared round-trip cost as
+a percentage of notional without dividing by leverage. Options are ~116x levered,
+which very nearly cancels their much larger percentage cost.
+
+Break-even **index** move by hold time:
+
+| hold | option | future | wins |
+|------|--------|--------|------|
+| 5 min | 0.0154% | 0.0350% | option |
+| 30 min | 0.0301% | 0.0350% | option |
+| 45 min | 0.0389% | 0.0350% | **future** |
+| 120 min | 0.0831% | 0.0350% | **future** |
+
+The instrument is not the problem; **theta is, and only past ~20 minutes.** Every
+screened signal falls short on both: `first_hour` inverted is 2.4x short,
+`ema_trend` 3.9x, `volume_breakout` 4.9x.
+
+`signal_lab --instrument future --hold N` reports the hurdle beside each signal
+and flags any that clears it.
+
+---
+
 ## 2026-09-03 — Atomic state file (same root cause as the entry race)
 
 `❌ Error loading StrategyBrain state: Extra data: line 1 column 2034` — a JSON
