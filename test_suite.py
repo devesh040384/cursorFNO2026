@@ -2100,5 +2100,106 @@ class StateFileTests(unittest.TestCase):
         self.assertIn("signal_bar_sec", state)
 
 
+
+class ExitClaimTests(unittest.TestCase):
+    """The trailing-stop loop (5s) and the EOD loop (10s) both scan for OPEN
+    rows. In live mode execute_exit sends the broker SELL before close_trade is
+    consulted, so two callers would send two SELLs and leave a net SHORT."""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db = DatabaseManager(self.path)
+        self.trade_id = self.db.log_trade(
+            "NIFTY26SEP24000CE", "1", 100.0, 130.0, 90.0,
+            qty=65, exchange="NFO", index_name="NIFTY")
+
+    def tearDown(self):
+        os.remove(self.path)
+
+    def test_only_one_caller_wins_the_claim(self):
+        self.assertTrue(self.db.claim_for_exit(self.trade_id))
+        self.assertFalse(self.db.claim_for_exit(self.trade_id))
+
+    def test_concurrent_claims_yield_exactly_one_winner(self):
+        won = []
+
+        def go():
+            won.append(self.db.claim_for_exit(self.trade_id))
+
+        threads = [threading.Thread(target=go) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(1 for w in won if w), 1, "two callers would both SELL")
+
+    def test_release_allows_a_retry(self):
+        self.db.claim_for_exit(self.trade_id)
+        self.assertTrue(self.db.release_claim(self.trade_id))
+        self.assertTrue(self.db.claim_for_exit(self.trade_id))
+
+    def test_claimed_row_still_counts_as_an_open_position(self):
+        """Otherwise a claim would free a slot and let a new entry in."""
+        self.assertEqual(self.db.count_open_trades("NIFTY"), 1)
+        self.db.claim_for_exit(self.trade_id)
+        self.assertEqual(self.db.count_open_trades("NIFTY"), 1)
+        self.assertEqual(self.db.count_open_trades(), 1)
+
+    def test_close_accepts_a_claimed_row(self):
+        self.db.claim_for_exit(self.trade_id)
+        self.assertTrue(self.db.close_trade(self.trade_id, 120.0, "TARGET_HIT"))
+        self.assertEqual(self.db.count_open_trades(), 0)
+
+    def test_second_exit_attempt_is_refused_end_to_end(self):
+        class API:
+            def ltpData(self, *a, **k):
+                return {"status": True, "data": {"ltp": 120.0}}
+
+        engine = OrderExecutionEngine(API(), self.db, paper_trading=True)
+        first = engine.execute_exit(self.trade_id, "NIFTY26SEP24000CE", "1", 65,
+                                    "NFO", 120.0, reason="TARGET_HIT")
+        second = engine.execute_exit(self.trade_id, "NIFTY26SEP24000CE", "1", 65,
+                                     "NFO", 120.0, reason="EOD_SQUAREOFF")
+        self.assertTrue(first)
+        self.assertFalse(second)
+
+
+class InstrumentCostTests(unittest.TestCase):
+    """Comparing round-trip cost percentages across instruments is meaningless
+    without dividing by leverage — that mistake made futures look 15x cheaper."""
+
+    def test_option_leverage_offsets_option_cost(self):
+        import signal_lab as sl
+        # At a short hold the option's 116x leverage more than pays for its
+        # much larger percentage cost.
+        self.assertLess(sl.required_index_move_pct("option", 5),
+                        sl.required_index_move_pct("future", 5))
+
+    def test_theta_flips_the_answer_on_longer_holds(self):
+        import signal_lab as sl
+        self.assertGreater(sl.required_index_move_pct("option", 120),
+                           sl.required_index_move_pct("future", 120))
+
+    def test_future_hurdle_is_flat_in_time(self):
+        import signal_lab as sl
+        self.assertAlmostEqual(sl.required_index_move_pct("future", 5),
+                               sl.required_index_move_pct("future", 240), places=9)
+
+    def test_net_edge_subtracts_cost_and_theta(self):
+        import signal_lab as sl
+        gross, cost, net = sl.net_edge_pct(0.05, "option", 60)
+        self.assertAlmostEqual(gross, 0.05 * 116.0)
+        self.assertAlmostEqual(cost, 1.44 + 4.1)
+        self.assertAlmostEqual(net, gross - cost)
+
+    def test_measured_signals_all_fall_short(self):
+        """Pins the finding: no screened signal clears either instrument."""
+        import signal_lab as sl
+        for mean in (0.0148, 0.0090, 0.0071):
+            self.assertLess(mean, sl.required_index_move_pct("option", 30))
+            self.assertLess(mean, sl.required_index_move_pct("future", 30))
+
+
 if __name__ == "__main__":
     unittest.main()

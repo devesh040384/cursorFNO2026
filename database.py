@@ -159,6 +159,41 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"❌ Failed to update TSL for trade {trade_id}: {e}")
 
+    def claim_for_exit(self, trade_id):
+        """Atomically move OPEN -> EXITING. True only for the winning caller.
+
+        The trailing-stop loop (5s) and the EOD loop (10s) both scan for OPEN
+        rows, so at 15:15 they can pick up the same trade. In live mode
+        execute_exit places the broker SELL *before* close_trade is consulted,
+        so two callers would send two SELLs and leave a net SHORT position --
+        close_trade's "AND status = 'OPEN'" guard protects the database, not the
+        broker. Claiming the row first makes the DB the arbiter, before any
+        order is sent.
+        """
+        try:
+            with self.get_cursor() as cursor:
+                cursor.execute(
+                    "UPDATE trades SET status = 'EXITING' WHERE id = ? AND status = 'OPEN'",
+                    (trade_id,),
+                )
+                return bool(cursor.rowcount)
+        except Exception as e:
+            logging.error(f"❌ Failed to claim trade {trade_id} for exit: {e}")
+            return False
+
+    def release_claim(self, trade_id):
+        """Return EXITING -> OPEN when an exit attempt fails, so it retries."""
+        try:
+            with self.get_cursor() as cursor:
+                cursor.execute(
+                    "UPDATE trades SET status = 'OPEN' WHERE id = ? AND status = 'EXITING'",
+                    (trade_id,),
+                )
+                return bool(cursor.rowcount)
+        except Exception as e:
+            logging.error(f"❌ Failed to release trade {trade_id}: {e}")
+            return False
+
     def close_trade(self, trade_id, exit_price, exit_reason):
         try:
             now_ist = ist_stamp()
@@ -167,7 +202,7 @@ class DatabaseManager:
                     """
                     UPDATE trades
                     SET status = 'CLOSED', exit_price = ?, exit_reason = ?, exit_time = ?
-                    WHERE id = ? AND status = 'OPEN'
+                    WHERE id = ? AND status IN ('OPEN', 'EXITING')
                     """,
                     (exit_price, exit_reason, now_ist, trade_id),
                 )
@@ -185,11 +220,13 @@ class DatabaseManager:
         try:
             if index_name:
                 row = self.fetch_one(
-                    "SELECT COUNT(*) AS n FROM trades WHERE status = 'OPEN' AND index_name = ?",
+                    "SELECT COUNT(*) AS n FROM trades WHERE status IN ('OPEN','EXITING')"
+                    " AND index_name = ?",
                     (index_name,),
                 )
             else:
-                row = self.fetch_one("SELECT COUNT(*) AS n FROM trades WHERE status = 'OPEN'")
+                row = self.fetch_one(
+                    "SELECT COUNT(*) AS n FROM trades WHERE status IN ('OPEN','EXITING')")
             if row is None:
                 return 0
             return int(row[0])

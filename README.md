@@ -2,7 +2,33 @@
 
 Paper-first Angel One SmartAPI bot for **index options**. It classifies index regime, gates entries with futures volume, buys ATM CE/PE, and manages exits with trailing stop, time-stop, and EOD square-off.
 
-Keep `PAPER_TRADING = True` in `config.py` until paper results are stable.
+> ## Status: the strategy does not work. Do not trade it live.
+>
+> `VOLUME_BREAKOUT` — around 90% of all entries — does not predict index
+> movement. Four independent methods agree, and the two that matter most use no
+> option model at all:
+>
+> | Evidence | Result |
+> |----------|--------|
+> | Backtest, 1,146 trades over 248 sessions | expectancy **−₹88/trade**, t = −6.5 |
+> | Live index excursion, 30 trades | median move after a signal: **0.08%** |
+> | Forward excursion vs a random walk | **below diffusion** at every window |
+> | Signal screen, 248 sessions | fails the multiple-testing bar; does not replicate across indices |
+>
+> It also loses **before costs** (−₹30.7/trade gross), and costs are ~₹60/round
+> trip on a ~₹6,000 notional — roughly half the edge the strategy would need.
+>
+> The one candidate that looked real (`first_hour`, inverted) **failed
+> out-of-sample**: the entire effect sits in one half of the year and is absent
+> from the last 20 sessions.
+>
+> **What is worth keeping is the infrastructure** — fill confirmation, circuit
+> breakers, IST correctness, seeding, and a research harness that can kill a bad
+> signal in an afternoon rather than a quarter. Run the bot in paper as a free
+> control while researching a different edge.
+
+`PAPER_TRADING = True` in `config.py`. Live mode is gated behind
+`preflight_check.py --live` and should stay unused.
 
 ---
 
@@ -54,7 +80,7 @@ python3 -m unittest test_suite.py -v
 | `backtest_engine.py` | **Separate.** Replays the live strategy over cached history |
 | `backtest_options.py` | Black-Scholes ATM pricing + Angel One cost model |
 | `backtest_data.py` | Candle fetch + CSV cache |
-| `signal_lab.py` | **Screens signal hypotheses on index data — no options, no costs** |
+| `signal_lab.py` | **Screens signal hypotheses on index data — no options, no costs**; `--validate` for out-of-sample |
 | `trade_analysis.py` | **Separate.** Index excursion per trade: signal failure vs exit failure |
 | `telegram_notifier.py` | **Separate process.** Telegram alerts + remote status. Touches no trading file. |
 | `config.py` | All live knobs |
@@ -76,6 +102,19 @@ every session until 2026-09-02.
 If the candle API fails or returns too few bars, the bot logs an **ERROR**
 naming the consequence and falls back to live warmup — it does not trade on
 partial history. Check the `[seed]` lines every morning.
+
+**Rate limits.** The historical endpoint is limited far below the order API and
+replies in plain text, so the client raises a *parse error* rather than returning
+a status — `Access denied because of exceeding access rate`. Seeding detects that
+by message text and backs off exponentially (4s → 8s → 16s, capped at 30) rather
+than retrying immediately, and paces its calls 1.5s apart. `RateLimitedAPI` is
+per-process and knows nothing about this endpoint's tighter budget.
+
+**The request window is computed, not fixed.** `required_price_bars()` (22 for
+the regime gate plus margin) and `required_volume_bars()` (from
+`volume_sma_bars`) drive `lookback_days()`. Asking for six days to fill thirty
+5-minute bars is ~5× more payload than the job needs, and payload size is what
+trips the limit.
 
 **Hybrid timeframe**
 
@@ -269,6 +308,27 @@ enable_choppy_entries             = False
 
 ---
 
+## Concurrency
+
+Ticks arrive on the SmartWebSocketV2 callback thread, and **more than one can be
+in flight at once**. Three production bugs in two days came from that single
+fact, so anything reached from a tick handler needs the same scrutiny:
+
+| Symptom | Cause | Guard |
+|---------|-------|-------|
+| Two identical SENSEX positions at the same second, against a cap of 1 | `assess_order_safety` read the DB, `log_trade` wrote it, nothing held between | `ENTRY_LOCK` across check-and-write, **plus** one entry per index per signal bar |
+| `rsi_state.json` spliced: *Extra data: line 1 column 2034* | two `open("w")` writers truncating over each other | `STATE_LOCK`, **plus** write-to-temp and `os.replace` so a crash cannot splice |
+| Volume bars double-counted | duplicate ticks | dedupe on `sequence_number`, else `(volume_today, last_qty)` |
+| **Two broker SELLs on one trade** (live only) | TSL (5s) and EOD (10s) loops both scan `OPEN`; the SELL is sent *before* `close_trade` is consulted, so its `AND status='OPEN'` guard protects the DB, not the broker | `claim_for_exit` moves `OPEN → EXITING` atomically **before** any order; `release_claim` on every failure path |
+
+A claimed row still counts toward the open-position caps — otherwise claiming
+one would free a slot and admit a new entry against a position not yet gone.
+
+Each has two guards deliberately. A lock does not survive a kill signal
+mid-write; an atomic swap does not stop two threads both deciding to trade.
+
+---
+
 ## Execution (live mode)
 
 Paper mode fills instantly at LTP. **Live crosses the bid-ask, and that cost is
@@ -432,6 +492,56 @@ signals that clear it.
 Signals shipped: `volume_breakout` (the current live one, as a control), `orb`
 (opening-range break), `mean_reversion`, `nr7` (range contraction then break),
 `ema_trend`, `first_hour`. Adding one is a function in `SIGNALS`.
+
+### Out-of-sample validation — do not skip this
+
+```bash
+python3 signal_lab.py --validate first_hour
+```
+
+Runs one signal over **disjoint** periods — first half, second half, last 60
+sessions, last 20 — and prints each separately. A finding discovered on all the
+data is not evidence until it survives on data it was not discovered on. **Signs
+must agree across every period.**
+
+This is not theoretical. `first_hour` screened at t = −6.44 (NIFTY) and −4.67
+(SENSEX) on the full history, which looked like a real fade-the-open edge. Split
+apart:
+
+| Period | NIFTY 45m | SENSEX 45m |
+|--------|-----------|------------|
+| first half | t = −1.27 | **t = +0.65** |
+| second half | t = −6.91 | t = −6.12 |
+| last 60 | t = −5.34 | t = −2.46 |
+| **last 20** | **t = −1.77** | **t = −0.70** |
+
+The entire effect lives in the second half, SENSEX flips sign in the first, and
+the recent period is null. A regime artifact, not an edge.
+
+`--since` / `--until` screen a specific window directly.
+
+### Judging an edge against an instrument
+
+```bash
+python3 signal_lab.py --instrument future --hold 45
+```
+
+A signal is only useful if its edge clears the cost of the instrument used to
+express it. Comparing round-trip cost percentages across instruments is
+meaningless without dividing by leverage — options are ~116× levered, which very
+nearly cancels their much larger percentage cost:
+
+| hold | option | future | wins |
+|------|--------|--------|------|
+| 5 min | 0.0154% | 0.0350% | option |
+| 30 min | 0.0301% | 0.0350% | option |
+| 45 min | 0.0389% | 0.0350% | **future** |
+| 120 min | 0.0831% | 0.0350% | **future** |
+
+**The instrument is not the problem — theta is, and only past ~20 minutes.**
+Every screened signal falls short on both: `first_hour` inverted by 2.4×,
+`ema_trend` by 3.9×, `volume_breakout` by 4.9×. Moving to futures would not have
+rescued them.
 
 ---
 
