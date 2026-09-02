@@ -25,8 +25,53 @@ _INTERVALS = {
 
 # Enough closed bars for EMA21 + Wilder RSI(14) warmup with headroom.
 SEED_BARS = 60
-# Calendar days to look back; NSE holidays/weekends make this deliberately loose.
+# Upper bound only. The actual window is computed from what the indicators need
+# (see lookback_days) so the payload stays as small as the job allows -- an
+# oversized request is the fastest way to trip the historical-data rate limit.
 LOOKBACK_DAYS = 6
+MAX_LOOKBACK_DAYS = 10
+
+# Angel One's historical endpoint is rate-limited well below the order API, and
+# it answers with a plain-text body rather than JSON, so the client raises a
+# parse error instead of returning a status. Match on the text.
+RATE_LIMIT_MARKERS = ("exceeding access rate", "access denied", "rate limit",
+                      "too many requests", "429")
+# Pacing between seed calls. The account limiter is per-process and does not
+# know about the historical endpoint's tighter budget.
+SEED_CALL_SPACING_SEC = 1.5
+_last_call_at = [0.0]
+
+
+def looks_rate_limited(error):
+    text = str(error or "").lower()
+    return any(marker in text for marker in RATE_LIMIT_MARKERS)
+
+
+def required_price_bars():
+    """Closed bars the strategy needs before it will classify a regime.
+
+    evaluate_tick refuses to act under 22 bars; EMA21 needs 21 and Wilder RSI(14)
+    needs 15, so 22 binds. The margin covers the dropped forming bar and a
+    session that opens late.
+    """
+    return 22 + 8
+
+
+def required_volume_bars():
+    """Bars the RVOL gate needs, from config rather than a guess."""
+    return int(RISK.get("volume_sma_bars", 8)) * 2 + 4
+
+
+def lookback_days(bars_needed):
+    """Smallest calendar window that can contain `bars_needed` closed bars.
+
+    Requesting six days to fill thirty 5-minute bars is ~5x more payload than
+    the job needs, and payload size is what trips the limit.
+    """
+    per_session = max(1, (375 * 60) // signal_bar_sec())
+    sessions = max(1, -(-int(bars_needed) // per_session))
+    # +3 covers a weekend, +1 more for a holiday adjacent to it.
+    return min(MAX_LOOKBACK_DAYS, sessions + 4)
 
 
 def now_ist():
@@ -49,10 +94,15 @@ def _parse_ts(raw):
     return dt.astimezone(IST)
 
 
-def fetch_candles(smart_api, exchange, token, interval, days_back=LOOKBACK_DAYS, retries=2):
-    """Return [(ist_dt, open, high, low, close, volume), ...] oldest first, or []."""
+def fetch_candles(smart_api, exchange, token, interval, days_back=None, retries=3):
+    """Return [(ist_dt, open, high, low, close, volume), ...] oldest first, or [].
+
+    Paces itself and backs off hard on rate-limit responses, which are the
+    normal failure here rather than an exceptional one.
+    """
     if not smart_api or not token or not interval:
         return []
+    days_back = LOOKBACK_DAYS if days_back is None else days_back
     to_dt = now_ist()
     from_dt = to_dt - timedelta(days=days_back)
     params = {
@@ -63,7 +113,11 @@ def fetch_candles(smart_api, exchange, token, interval, days_back=LOOKBACK_DAYS,
         "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
     }
     for attempt in range(retries + 1):
+        gap = time.time() - _last_call_at[0]
+        if gap < SEED_CALL_SPACING_SEC:
+            time.sleep(SEED_CALL_SPACING_SEC - gap)
         try:
+            _last_call_at[0] = time.time()
             resp = smart_api.getCandleData(params)
             if resp and resp.get("status") and resp.get("data"):
                 rows = []
@@ -77,6 +131,17 @@ def fetch_candles(smart_api, exchange, token, interval, days_back=LOOKBACK_DAYS,
             msg = resp.get("message") if isinstance(resp, dict) else resp
             logging.warning(f"[seed] candle fetch rejected {exchange}:{token} -> {msg}")
         except Exception as e:
+            if looks_rate_limited(e):
+                # Back off far harder than a normal retry: hammering a rate limit
+                # is what turns a transient block into a sustained one.
+                wait = min(30.0, 4.0 * (2 ** attempt))
+                logging.warning(
+                    f"[seed] rate limited on {exchange}:{token} "
+                    f"(attempt {attempt + 1}/{retries + 1}); waiting {wait:.0f}s"
+                )
+                if attempt < retries:
+                    time.sleep(wait)
+                continue
             logging.warning(f"[seed] candle fetch error {exchange}:{token} ({attempt + 1}): {e}")
         if attempt < retries:
             time.sleep(1.5 * (attempt + 1))
@@ -107,7 +172,8 @@ def seed_price_history(smart_api, brain, symbol, bars=SEED_BARS):
     # failed silently and NIFTY ran on cold warmup — no entries until ~10:50.
     token = history_token(symbol)
     rows = _drop_forming_bar(
-        fetch_candles(smart_api, cfg.get("exchange", "NSE"), token, interval)
+        fetch_candles(smart_api, cfg.get("exchange", "NSE"), token, interval,
+                      days_back=lookback_days(required_price_bars()))
     )
     if len(rows) < 22:
         logging.error(
@@ -151,7 +217,8 @@ def seed_volume_history(smart_api, gate, symbol, fut, bars=None):
         return 0
 
     rows = _drop_forming_bar(
-        fetch_candles(smart_api, fut.get("exchange", "NFO"), fut.get("token"), interval)
+        fetch_candles(smart_api, fut.get("exchange", "NFO"), fut.get("token"), interval,
+                      days_back=lookback_days(required_volume_bars()))
     )
     vols = [r[5] for r in rows[-bars:] if r[5] > 0]
     if len(vols) < need:

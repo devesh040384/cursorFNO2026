@@ -2,6 +2,7 @@ import io
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 import time
 from datetime import datetime
@@ -258,6 +259,9 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertEqual(len(om.calls), 1)
 
         gate.breakout_event["NIFTY"] = time_mod.time()
+        # Live these are two separate 5-min bars. One entry per index per signal
+        # bar is now enforced, so clear the marker to represent the next bar.
+        brain.last_entry_bucket["NIFTY"] = None
         chop_up = brain._try_volume_breakout("NIFTY", 101.0, 100.0, "CHOPPY", cfg)
         self.assertTrue(chop_up)
         self.assertEqual(om.calls[-1]["entry_reason"], "VOLUME_BREAKOUT")
@@ -1959,6 +1963,89 @@ class StabilityTests(unittest.TestCase):
         import signal_lab as sl
         self.assertEqual(sl.stability_t(-0.01, 0.0, -0.02, -3.0), 0.0)
         self.assertEqual(sl.stability_t(-0.01, -3.0, -0.02, 0.0), 0.0)
+
+
+
+class EntryRaceTests(unittest.TestCase):
+    """Two websocket callback threads both passed the max-open check before
+    either wrote its row, producing two identical SENSEX positions at 13:35:03
+    on 2026-09-02 against a cap of one."""
+
+    class _Recorder:
+        def __init__(self, delay=0.0):
+            self.calls = []
+            self.delay = delay
+            self.db_manager = None
+
+            class API:
+                def ltpData(self, *a, **k):
+                    return {"status": True, "data": {"ltp": 100.0}}
+            self.smart_api = API()
+
+        def execute_entry(self, **kw):
+            time.sleep(self.delay)     # widen the check-then-act window
+            self.calls.append(kw)
+            return "ok%d" % len(self.calls)
+
+    class _Builder:
+        def get_nearest_expiry_contract(self, spot, instrument_type="CE"):
+            return {"symbol": "SENSEXSYNCE", "token": "1", "lotsize": 20,
+                    "exchange": "BFO", "dte": 1, "expiry": "X", "spread_pct": 0.2}
+
+    class _PermissiveRisk:
+        trading_halted = False
+
+        def refresh_from_db(self):
+            pass
+
+        def assess_order_safety(self, proposal, estimated_premium=0.0):
+            return True
+
+    def _brain(self, delay=0.0):
+        from config import INDICES_CONFIG
+        om = self._Recorder(delay)
+        brain = StrategyBrain(order_engine=om, options_builders={})
+        brain.options_builders[str(INDICES_CONFIG["SENSEX"]["index_token"])] = self._Builder()
+        brain.risk = self._PermissiveRisk()
+        return brain, om
+
+    def test_same_bar_entry_is_suppressed(self):
+        brain, om = self._brain()
+        self.assertTrue(brain._trigger_entry("SENSEX", 76400.0, "CE", 1.3, 0.9))
+        # Same signal bar, so the second must not open a position.
+        self.assertFalse(brain._trigger_entry("SENSEX", 76400.0, "CE", 1.3, 0.9))
+        self.assertEqual(len(om.calls), 1)
+
+    def test_next_bar_is_allowed_again(self):
+        brain, om = self._brain()
+        brain._trigger_entry("SENSEX", 76400.0, "CE", 1.3, 0.9)
+        brain.last_entry_bucket["SENSEX"] = None      # next signal bar
+        brain._trigger_entry("SENSEX", 76400.0, "CE", 1.3, 0.9)
+        self.assertEqual(len(om.calls), 2)
+
+    def test_concurrent_threads_open_only_one_position(self):
+        """The actual failure: simultaneous callers, widened window."""
+        brain, om = self._brain(delay=0.05)
+        results = []
+
+        def go():
+            results.append(brain._trigger_entry("SENSEX", 76400.0, "CE", 1.3, 0.9))
+
+        threads = [threading.Thread(target=go) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(om.calls), 1, "duplicate positions opened concurrently")
+        self.assertEqual(sum(1 for r in results if r), 1)
+
+    def test_indices_do_not_block_each_other(self):
+        from config import INDICES_CONFIG
+        brain, om = self._brain()
+        brain.options_builders[str(INDICES_CONFIG["NIFTY"]["index_token"])] = self._Builder()
+        brain._trigger_entry("SENSEX", 76400.0, "CE", 1.3, 0.9)
+        brain._trigger_entry("NIFTY", 24000.0, "CE", 1.3, 0.9)
+        self.assertEqual(len(om.calls), 2)
 
 
 if __name__ == "__main__":
