@@ -4,6 +4,29 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-03 — Option-chain collector (positioning research)
+
+Price and volume signals are exhausted: six screened, all null, all 2.4–4.9×
+short of a tradeable threshold on either instrument. The next hypothesis is
+options positioning — COI divergence, gamma walls, PCR momentum.
+
+**It cannot be backtested.** `getCandleData` returns OHLCV with no open interest,
+and expired contracts are delisted, so no chain history exists to buy or fetch.
+OI must be collected forward before any hypothesis about it can be tested.
+
+`oi_collector.py` runs as its own process, snapshotting ATM ±5 strikes of the
+nearest expiry every 3 minutes (~0.011 calls/sec).
+
+**Store raw, derive later.** No COI deltas, PCR or gamma walls are computed at
+capture — those definitions will change, and a premature aggregation would
+destroy the data needed to test the next version. Missing OI is `NULL`, never
+`0`, because a zero reads as real data in later analysis.
+
+**Expect 2–4 months before a verdict:** ~40 sessions for a first read, double
+that for an out-of-sample split.
+
+---
+
 ## 2026-09-03 — Concurrency audit + instrument cost model
 
 **Audit finding: double-SELL exposure (live only).** The trailing-stop loop (5s)

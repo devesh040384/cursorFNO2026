@@ -2201,5 +2201,141 @@ class InstrumentCostTests(unittest.TestCase):
             self.assertLess(mean, sl.required_index_move_pct("future", 30))
 
 
+
+class OICollectorTests(unittest.TestCase):
+    """Open interest cannot be backtested — getCandleData has no OI field and
+    expired contracts are delisted — so this data is only ever collected
+    forward. Losing or mangling it costs weeks, not minutes."""
+
+    class StubAPI:
+        def __init__(self, oi_key="opnInterest"):
+            self.oi_key = oi_key
+            self.calls = 0
+
+        def getMarketData(self, mode, exchangeTokens):
+            self.calls += 1
+            rows = []
+            for _, toks in exchangeTokens.items():
+                for t in toks:
+                    row = {"symbolToken": t, "ltp": 250.0, "tradeVolume": 4200.0,
+                           "depth": {"buy": [{"price": 249.5}], "sell": [{"price": 250.5}]}}
+                    if self.oi_key:
+                        row[self.oi_key] = 123456.0
+                    rows.append(row)
+            return {"status": True, "data": {"fetched": rows}}
+
+    def _builder(self):
+        from options_chain_builder import DynamicOptionsChainBuilder
+        scrip = []
+        for k in range(76000, 77100, 100):
+            for t in ("CE", "PE"):
+                scrip.append({"name": "SENSEX", "symbol": "SENSEX26SEP%d%s" % (k, t),
+                              "token": "T%d%s" % (k, t), "strike": float(k * 100),
+                              "expiry": "24-Sep-2026", "instrumenttype": "OPTIDX",
+                              "exch_seg": "BFO", "lotsize": 20})
+        b = DynamicOptionsChainBuilder(index_name="SENSEX", smart_api=None)
+        b.load_scrip_master(scrip)
+        return b
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.remove(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def test_captures_atm_window_both_sides(self):
+        import oi_collector as oc
+        conn = oc.connect(self.path)
+        try:
+            n = oc.snapshot(conn, self.StubAPI(), {"SENSEX": self._builder()},
+                            {"SENSEX": 76550.0})
+            self.assertEqual(n, 22)          # ATM +/- 5 strikes, CE and PE
+            strikes = [r[0] for r in conn.execute(
+                "SELECT DISTINCT strike FROM chain_snapshots ORDER BY strike")]
+            self.assertLess(min(strikes), 76550.0)
+            self.assertGreater(max(strikes), 76550.0)
+            types = {r[0] for r in conn.execute(
+                "SELECT DISTINCT option_type FROM chain_snapshots")}
+            self.assertEqual(types, {"CE", "PE"})
+        finally:
+            conn.close()
+
+    def test_open_interest_is_stored(self):
+        import oi_collector as oc
+        conn = oc.connect(self.path)
+        try:
+            oc.snapshot(conn, self.StubAPI(), {"SENSEX": self._builder()}, {"SENSEX": 76550.0})
+            missing = conn.execute(
+                "SELECT COUNT(*) FROM chain_snapshots WHERE open_interest IS NULL").fetchone()[0]
+            self.assertEqual(missing, 0)
+        finally:
+            conn.close()
+
+    def test_alternate_oi_field_name_is_accepted(self):
+        """SmartAPI field naming varies; a rename must not silently null the column."""
+        import oi_collector as oc
+        conn = oc.connect(self.path)
+        try:
+            oc.snapshot(conn, self.StubAPI(oi_key="openInterest"),
+                        {"SENSEX": self._builder()}, {"SENSEX": 76550.0})
+            missing = conn.execute(
+                "SELECT COUNT(*) FROM chain_snapshots WHERE open_interest IS NULL").fetchone()[0]
+            self.assertEqual(missing, 0)
+        finally:
+            conn.close()
+
+    def test_missing_oi_is_recorded_as_null_not_zero(self):
+        """A zero would look like real data in later analysis; NULL cannot."""
+        import oi_collector as oc
+        conn = oc.connect(self.path)
+        try:
+            oc.snapshot(conn, self.StubAPI(oi_key=None),
+                        {"SENSEX": self._builder()}, {"SENSEX": 76550.0})
+            zeros = conn.execute(
+                "SELECT COUNT(*) FROM chain_snapshots WHERE open_interest = 0").fetchone()[0]
+            nulls = conn.execute(
+                "SELECT COUNT(*) FROM chain_snapshots WHERE open_interest IS NULL").fetchone()[0]
+            self.assertEqual(zeros, 0)
+            self.assertGreater(nulls, 0)
+        finally:
+            conn.close()
+
+    def test_raw_response_is_kept_for_later_derivation(self):
+        """Store raw, derive later: metric definitions will change."""
+        import json
+        import oi_collector as oc
+        conn = oc.connect(self.path)
+        try:
+            oc.snapshot(conn, self.StubAPI(), {"SENSEX": self._builder()}, {"SENSEX": 76550.0})
+            raw = conn.execute("SELECT raw FROM chain_snapshots LIMIT 1").fetchone()[0]
+            self.assertIn("symbolToken", json.loads(raw))
+        finally:
+            conn.close()
+
+    def test_snapshots_accumulate_rather_than_overwrite(self):
+        import oi_collector as oc
+        conn = oc.connect(self.path)
+        try:
+            for _ in range(3):
+                oc.snapshot(conn, self.StubAPI(), {"SENSEX": self._builder()},
+                            {"SENSEX": 76550.0})
+            total = conn.execute("SELECT COUNT(*) FROM chain_snapshots").fetchone()[0]
+            self.assertEqual(total, 66)
+        finally:
+            conn.close()
+
+    def test_no_spot_means_no_rows(self):
+        import oi_collector as oc
+        conn = oc.connect(self.path)
+        try:
+            self.assertEqual(
+                oc.snapshot(conn, self.StubAPI(), {"SENSEX": self._builder()}, {}), 0)
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
