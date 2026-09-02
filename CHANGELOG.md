@@ -4,6 +4,43 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-03 — Duplicate-entry race + seeding rate limits (LIVE)
+
+**Duplicate positions (serious).** Trades 136 and 137 on 2026-09-02 are the same
+contract, same second (13:35:03), same fill price — two SENSEX positions against
+`max_open_per_index = 1`, i.e. double the intended risk.
+
+Entries run on the websocket callback thread. `assess_order_safety` reads the DB,
+`log_trade` writes it, and nothing held in between, so two ticks arriving together
+both passed the cap check before either wrote a row. Reproduced: six concurrent
+callers opened **six** positions.
+
+Two guards, both needed:
+
+- `ENTRY_LOCK` held from the risk check through the DB write, closing the
+  check-then-act window.
+- One entry per index per signal bar (`last_entry_bucket`), which also survives a
+  retry path and does not depend on lock scope.
+
+Six concurrent callers now open exactly one position.
+
+**Seeding rate limits.** `[seed] candle fetch error BFO:844615: Access denied
+because of exceeding access rate`. The historical endpoint is limited far below
+the order API and replies in plain text, so the client raises a parse error rather
+than returning a status — the old generic handler retried after 1.5s and kept
+hitting it.
+
+- Rate-limit responses are now detected by message text and backed off
+  exponentially (4s → 8s → 16s, capped at 30) instead of retried immediately.
+- Calls are paced 1.5s apart; the account limiter is per-process and knows
+  nothing about this endpoint's tighter budget.
+- **The window is now computed, not guessed.** `required_price_bars()` (22 for
+  the regime gate + margin = 30) and `required_volume_bars()` (from
+  `volume_sma_bars`) drive `lookback_days()`, cutting the request from a fixed 6
+  days to 5 — and it now shrinks automatically if the indicators do.
+
+---
+
 ## 2026-09-02 — Signal screening lab
 
 `VOLUME_BREAKOUT` failed, but a full backtest could not say *which part* failed:

@@ -1,3 +1,4 @@
+import threading
 import time
 import json
 import os
@@ -6,6 +7,13 @@ from config import FALLBACK_LOT_SIZE, INDICES_CONFIG, RISK, signal_bar_bucket, s
 from ist_time import ist_hhmm, ist_today
 from risk_manager import RiskManager
 from indicators import wilder_rsi, volume_expanded
+
+# Entries run on the websocket callback thread. Two ticks arriving together can
+# both pass the "max open per index" check before either has written its row --
+# the checks read the DB, the insert happens later, and nothing holds in between.
+# That produced two identical SENSEX positions at 13:35:03 on 2026-09-02, which
+# is double the intended risk on a cap of one.
+ENTRY_LOCK = threading.Lock()
 
 # Upper bound on the entry pause after a feed gap: EMA21 needs ~21 clean bars,
 # but pausing longer than that just wastes the session.
@@ -258,6 +266,9 @@ class StrategyBrain:
         self.last_candle_times = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
         self.last_signal_buckets = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.cooldown_until = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
+        # One entry per index per signal bar — the second line of defence behind
+        # ENTRY_LOCK, and the one that survives a process with two brains.
+        self.last_entry_bucket = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.last_closed_rsi = {symbol: 50.0 for symbol in INDICES_CONFIG.keys()}
         self.current_regimes = {symbol: "INITIALIZING" for symbol in INDICES_CONFIG.keys()}
         # Set when a tick gap distorts the bar series; blocks entries until enough
@@ -364,42 +375,56 @@ class StrategyBrain:
                 return False
             opt_ltp = float(ltp_resp["data"]["ltp"])
 
-            if not self.risk.assess_order_safety(
-                {
-                    "qty": qty,
-                    "index_name": symbol,
-                    "symbol": opt_symbol,
-                    "entry_reason": entry_reason,
-                },
-                estimated_premium=opt_ltp,
-            ):
-                return False
+            # Hold the lock from the risk check through the DB write so the
+            # check-then-act window cannot be interleaved.
+            with ENTRY_LOCK:
+                bucket = signal_bar_bucket(time.time())
+                if self.last_entry_bucket.get(symbol) == bucket:
+                    logging.info(
+                        f"[{symbol}] Entry suppressed: already entered on this signal bar."
+                    )
+                    return False
 
-            spread = contract.get("spread_pct")
-            spread_s = f"{spread:.2f}%" if spread is not None else "n/a"
-            target_price = round(opt_ltp * target_mult, 1)
-            sl_price = round(opt_ltp * sl_mult, 1)
-            logging.info(
-                f"[{symbol}] ENTRY {entry_reason} {option_type} {opt_symbol} qty={qty} @ ₹{opt_ltp} "
-                f"| T ₹{target_price} | SL ₹{sl_price} | DTE {contract.get('dte')} | spread {spread_s}"
-            )
-            order_id = self.order_manager.execute_entry(
-                symbol=opt_symbol,
-                token=opt_token,
-                qty=qty,
-                exchange=exchange,
-                price=opt_ltp,
-                target_price=target_price,
-                stop_loss_price=sl_price,
-                index_name=symbol,
-                entry_reason=entry_reason,
-                expiry=contract.get("expiry"),
-                dte=contract.get("dte"),
-                bid=contract.get("bid"),
-                ask=contract.get("ask"),
-                spread_pct=contract.get("spread_pct"),
-            )
-            return bool(order_id)
+                if not self.risk.assess_order_safety(
+                    {
+                        "qty": qty,
+                        "index_name": symbol,
+                        "symbol": opt_symbol,
+                        "entry_reason": entry_reason,
+                    },
+                    estimated_premium=opt_ltp,
+                ):
+                    return False
+
+                spread = contract.get("spread_pct")
+                spread_s = f"{spread:.2f}%" if spread is not None else "n/a"
+                target_price = round(opt_ltp * target_mult, 1)
+                sl_price = round(opt_ltp * sl_mult, 1)
+                logging.info(
+                    f"[{symbol}] ENTRY {entry_reason} {option_type} {opt_symbol} qty={qty} @ ₹{opt_ltp} "
+                    f"| T ₹{target_price} | SL ₹{sl_price} | DTE {contract.get('dte')} | spread {spread_s}"
+                )
+                order_id = self.order_manager.execute_entry(
+                    symbol=opt_symbol,
+                    token=opt_token,
+                    qty=qty,
+                    exchange=exchange,
+                    price=opt_ltp,
+                    target_price=target_price,
+                    stop_loss_price=sl_price,
+                    index_name=symbol,
+                    entry_reason=entry_reason,
+                    expiry=contract.get("expiry"),
+                    dte=contract.get("dte"),
+                    bid=contract.get("bid"),
+                    ask=contract.get("ask"),
+                    spread_pct=contract.get("spread_pct"),
+                )
+                if order_id:
+                    # Claim the bar even on a broker failure path below, so a
+                    # retry cannot double up within the same signal bar.
+                    self.last_entry_bucket[symbol] = bucket
+                return bool(order_id)
         except Exception as e:
             logging.error(f"❌ Entry failed for {symbol}: {e}")
             return False
