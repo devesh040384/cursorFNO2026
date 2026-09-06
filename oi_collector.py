@@ -267,7 +267,22 @@ def report(db_path=DB_FILE):
             out.append("  %-8s %-12s %8d %8d  %s .. %s"
                        % (idx, date, n, n_oi, first[11:16], last[11:16]))
         out.append("")
-        out.append("  %d session(s) collected. A first screen needs ~40;" % days)
+        # A verification snapshot taken outside market hours carries stale OI
+        # from the previous close. It must not be counted as a collected
+        # session, or the "how far along are we" number quietly overstates.
+        stale = conn.execute(
+            "SELECT DISTINCT trade_date FROM chain_snapshots WHERE"
+            " CAST(substr(captured_at, 12, 2) AS INTEGER) * 100"
+            " + CAST(substr(captured_at, 15, 2) AS INTEGER) NOT BETWEEN ? AND ?",
+            (SESSION_START_HHMM, SESSION_END_HHMM),
+        ).fetchall()
+        if stale:
+            out.append("  %d date(s) hold out-of-session rows (stale OI): %s"
+                       % (len(stale), ", ".join(d[0] for d in stale[:5])))
+            out.append("  Those are verification snapshots; delete before analysing.")
+            out.append("")
+        out.append("  %d session(s) collected, %d usable. A first screen needs ~40;"
+                   % (days, days - len(stale)))
         out.append("  an out-of-sample split needs roughly double that.")
         return out
     finally:
