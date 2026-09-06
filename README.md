@@ -492,6 +492,14 @@ table.
 Missing OI is stored as `NULL`, never `0`: a zero looks like real data later.
 The full response is kept in `raw` so a field-name change is recoverable.
 
+`--once` deliberately bypasses the session gate so the OI field can be verified
+any time, but outside market hours the values are **stale carry-over from the
+previous close**. Such rows are flagged by `--report` and excluded from the
+usable-session count — delete them before analysing:
+
+```bash
+sqlite3 oi_history.db "DELETE FROM chain_snapshots WHERE trade_date='YYYY-MM-DD'"
+```
 **Timeline:** ~40 sessions for a first read, roughly double for an out-of-sample
 split. That is 2–4 months of collection before any verdict — start now, and
 treat it as running in the background rather than as active work.

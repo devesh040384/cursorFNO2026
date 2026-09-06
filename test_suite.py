@@ -2337,5 +2337,59 @@ class OICollectorTests(unittest.TestCase):
             conn.close()
 
 
+
+class OIStaleRowTests(unittest.TestCase):
+    """--once bypasses the session gate on purpose, so verification snapshots
+    carry stale OI from the previous close. Counting one as a collected session
+    would overstate progress on a 40-session target."""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.remove(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _rows(self, conn, stamps):
+        conn.executemany(
+            "INSERT INTO chain_snapshots (captured_at, trade_date, index_name, expiry,"
+            " dte, strike, option_type, spot, ltp, open_interest, volume, bid, ask, raw)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(s, s[:10], "NIFTY", "24SEP2026", 17, 24000.0, "CE",
+              24000.0, 100.0, 5.0, 1.0, 1.0, 2.0, "{}") for s in stamps])
+        conn.commit()
+
+    def test_out_of_session_rows_are_flagged_and_excluded(self):
+        import oi_collector as oc
+        conn = oc.connect(self.path)
+        self._rows(conn, ["2026-09-06 23:55:00",     # Sunday night verification
+                          "2026-09-07 11:30:00",     # real
+                          "2026-09-08 14:00:00"])    # real
+        conn.close()
+        text = "\n".join(oc.report(self.path))
+        self.assertIn("2026-09-06", text)
+        self.assertIn("out-of-session", text)
+        self.assertIn("3 session(s) collected, 2 usable", text)
+
+    def test_all_in_session_reports_no_warning(self):
+        import oi_collector as oc
+        conn = oc.connect(self.path)
+        self._rows(conn, ["2026-09-07 09:30:00", "2026-09-08 15:20:00"])
+        conn.close()
+        text = "\n".join(oc.report(self.path))
+        self.assertNotIn("out-of-session", text)
+        self.assertIn("2 session(s) collected, 2 usable", text)
+
+    def test_session_bounds_are_inclusive_of_the_edges(self):
+        import oi_collector as oc
+        conn = oc.connect(self.path)
+        # 09:00 and 15:30 are the configured bounds and must count as usable.
+        self._rows(conn, ["2026-09-07 09:00:00", "2026-09-08 15:30:00"])
+        conn.close()
+        self.assertNotIn("out-of-session", "\n".join(oc.report(self.path)))
+
+
 if __name__ == "__main__":
     unittest.main()
