@@ -27,6 +27,16 @@ def looks_like_auth_failure(text):
     return any(marker in low for marker in AUTH_ERRORS)
 
 
+# A steady trickle of re-authentication is normal: tokens expire. A burst is
+# not, and the usual cause is a SECOND process logging in with the same client
+# id -- oi_collector.py alongside main.py, say. If the broker allows one active
+# session per client, each login invalidates the other's and the two processes
+# fight indefinitely, burning TOTP codes and dropping position management at
+# arbitrary moments. Detect it rather than leaving it to a manual log grep.
+CONTENTION_RELOGINS = 3
+CONTENTION_WINDOW_SEC = 600.0
+
+
 class SessionKeeper:
     """Re-authenticates on demand, at most once per `min_interval_sec`."""
 
@@ -35,8 +45,31 @@ class SessionKeeper:
         self.min_interval_sec = float(min_interval_sec)
         self._last_attempt = 0.0
         self._lock = threading.Lock()
+        self._relogin_times = []
         self.api = None
         self.relogin_count = 0
+
+    def _note_relogin(self):
+        """Flag session contention when re-auth clusters instead of trickling."""
+        now = time.time()
+        self._relogin_times.append(now)
+        self._relogin_times = [t for t in self._relogin_times
+                               if now - t <= CONTENTION_WINDOW_SEC]
+        if len(self._relogin_times) >= CONTENTION_RELOGINS:
+            logging.critical(
+                "[session] %d re-authentications in %.0f minutes. This is the "
+                "signature of ANOTHER PROCESS logging in with the same client id "
+                "(oi_collector.py alongside main.py). Stop the second process and "
+                "check whether the broker permits concurrent sessions.",
+                len(self._relogin_times), CONTENTION_WINDOW_SEC / 60.0)
+            return True
+        return False
+
+    @property
+    def contended(self):
+        now = time.time()
+        recent = [t for t in self._relogin_times if now - t <= CONTENTION_WINDOW_SEC]
+        return len(recent) >= CONTENTION_RELOGINS
 
     def ensure(self, force=False):
         """Return a live API handle, re-logging in if needed. None on failure."""
@@ -58,6 +91,7 @@ class SessionKeeper:
             self.api = new_api
             self.relogin_count += 1
             logging.warning(f"[session] re-authenticated (#{self.relogin_count}).")
+            self._note_relogin()
             return self.api
 
     def handle_error(self, error):

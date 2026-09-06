@@ -27,6 +27,35 @@ that for an out-of-sample split.
 
 ---
 
+## 2026-09-07 — Session contention between the two processes
+
+Running `oi_collector.py` alongside `main.py` means two logins on one client id.
+API load is not the concern — combined sustained rate is ~0.44 calls/sec, the
+collector contributing ~5%, and it never touches `getCandleData`, the endpoint
+that actually rate-limited seeding.
+
+The concern is **sessions**. If the broker permits one active session per client,
+each login invalidates the other's, `SessionKeeper` re-authenticates, and the two
+fight indefinitely — burning TOTP codes and dropping position management at
+arbitrary moments.
+
+Both sides now detect and handle it:
+
+- `SessionKeeper` logs **CRITICAL** when re-auth clusters (3 within 10 min) and
+  names the likely cause. Token expiry produces a trickle; contention produces a
+  burst, and the two are distinguishable.
+- The collector raises `AuthLost` on an invalidated session, backs off
+  **60s → 5m → 15m** rather than racing to re-authenticate, and **stops for the
+  session** after three. It is the lower-priority process: research data must
+  never cost position management its session.
+
+A rate-limit message is deliberately *not* treated as an auth failure — backing
+off 15 minutes for a transient throttle would be wrong.
+
+Credentials were rotated 7 Sep, so the values in `f897c89` are inert.
+
+---
+
 ## 2026-09-03 — Concurrency audit + instrument cost model
 
 **Audit finding: double-SELL exposure (live only).** The trailing-stop loop (5s)
