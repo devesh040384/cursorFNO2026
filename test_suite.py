@@ -2391,5 +2391,77 @@ class OIStaleRowTests(unittest.TestCase):
         self.assertNotIn("out-of-session", "\n".join(oc.report(self.path)))
 
 
+
+class SessionContentionTests(unittest.TestCase):
+    """A trickle of re-auth is normal (tokens expire). A burst means a second
+    process is logging in with the same client id and invalidating this one."""
+
+    def test_trickle_is_not_flagged(self):
+        from broker_health import SessionKeeper
+        k = SessionKeeper(lambda: "api", min_interval_sec=0)
+        k.ensure(force=True)
+        self.assertFalse(k.contended)
+
+    def test_burst_is_flagged_as_contention(self):
+        from broker_health import CONTENTION_RELOGINS, SessionKeeper
+        k = SessionKeeper(lambda: "api", min_interval_sec=0)
+        with self.assertLogs(level="CRITICAL") as captured:
+            for _ in range(CONTENTION_RELOGINS):
+                k.ensure(force=True)
+        self.assertTrue(k.contended)
+        joined = " ".join(captured.output)
+        self.assertIn("ANOTHER PROCESS", joined)
+        self.assertIn("oi_collector", joined)
+
+    def test_old_relogins_age_out_of_the_window(self):
+        import time as time_mod
+        from broker_health import CONTENTION_WINDOW_SEC, SessionKeeper
+        k = SessionKeeper(lambda: "api", min_interval_sec=0)
+        for _ in range(5):
+            k.ensure(force=True)
+        self.assertTrue(k.contended)
+        # Push every recorded re-login outside the window.
+        k._relogin_times = [t - CONTENTION_WINDOW_SEC - 1 for t in k._relogin_times]
+        self.assertFalse(k.contended)
+
+
+class CollectorYieldsTests(unittest.TestCase):
+    """The collector is the lower-priority process. Research data must never
+    cost position management its session."""
+
+    def test_auth_failures_are_distinguished_from_other_errors(self):
+        import oi_collector as oc
+        self.assertTrue(oc.looks_like_auth_failure("Invalid Token"))
+        self.assertTrue(oc.looks_like_auth_failure("session expired"))
+        # A rate limit is not an auth failure — backing off for 15 min would be wrong.
+        self.assertFalse(oc.looks_like_auth_failure("exceeding access rate"))
+        self.assertFalse(oc.looks_like_auth_failure("connection reset"))
+
+    def test_auth_failure_raises_authlost_not_a_silent_skip(self):
+        import oi_collector as oc
+
+        class API:
+            def getMarketData(self, mode, exchangeTokens):
+                raise RuntimeError("Invalid Token")
+
+        with self.assertRaises(oc.AuthLost):
+            oc.fetch_quotes(API(), "BFO", ["T1"])
+
+    def test_non_auth_error_is_swallowed_and_collection_continues(self):
+        import oi_collector as oc
+
+        class API:
+            def getMarketData(self, mode, exchangeTokens):
+                raise RuntimeError("connection reset by peer")
+
+        self.assertEqual(oc.fetch_quotes(API(), "BFO", ["T1"]), {})
+
+    def test_backoff_ladder_escalates_then_gives_up(self):
+        import oi_collector as oc
+        self.assertEqual(list(oc.AUTH_BACKOFF_SEC), sorted(oc.AUTH_BACKOFF_SEC))
+        self.assertEqual(oc.MAX_AUTH_FAILURES, len(oc.AUTH_BACKOFF_SEC))
+        self.assertGreaterEqual(oc.AUTH_BACKOFF_SEC[0], 60)
+
+
 if __name__ == "__main__":
     unittest.main()

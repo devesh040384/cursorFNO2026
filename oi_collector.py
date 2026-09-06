@@ -44,6 +44,13 @@ SESSION_START_HHMM = 900
 SESSION_END_HHMM = 1530
 # Angel One accepts a token list per call, but a very long list gets rejected.
 MAX_TOKENS_PER_CALL = 40
+# If the broker permits one session per client id, this process and main.py will
+# invalidate each other's tokens and re-login in a loop. The collector is the
+# lower-priority process -- position management must not be disrupted for
+# research data -- so it yields: it backs off hard rather than racing to
+# re-authenticate, and gives up for the session if the pattern persists.
+AUTH_BACKOFF_SEC = (60, 300, 900)
+MAX_AUTH_FAILURES = len(AUTH_BACKOFF_SEC)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chain_snapshots (
@@ -84,6 +91,10 @@ def _first(row, keys):
             except (TypeError, ValueError):
                 continue
     return None
+
+
+class AuthLost(Exception):
+    """The session was invalidated, most likely by another login."""
 
 
 def connect(db_path=DB_FILE):
@@ -152,14 +163,26 @@ def nearest_strikes(builder, spot, depth=STRIKE_DEPTH):
     return [r for r in rows if r["strike"] in wanted and r["token"]]
 
 
+def looks_like_auth_failure(error):
+    text = str(error or "").lower()
+    return any(m in text for m in
+               ("invalid token", "token expired", "session expired", "unauthorized",
+                "invalid session", "ag8001", "ag8002", "ag8003"))
+
+
 def fetch_quotes(smart_api, exchange, tokens):
-    """getMarketData FULL for a batch of tokens -> {token: row}."""
+    """getMarketData FULL for a batch of tokens -> {token: row}.
+
+    Raises AuthLost so the caller can yield the session rather than retry.
+    """
     out = {}
     for start in range(0, len(tokens), MAX_TOKENS_PER_CALL):
         batch = tokens[start:start + MAX_TOKENS_PER_CALL]
         try:
             resp = smart_api.getMarketData(mode="FULL", exchangeTokens={exchange: batch})
         except Exception as e:
+            if looks_like_auth_failure(e):
+                raise AuthLost(str(e))
             logging.warning("[oi] quote fetch failed for %s: %s", exchange, e)
             continue
         payload = (resp or {}).get("data") if isinstance(resp, dict) else None
@@ -327,11 +350,29 @@ def main(argv=None):
             return 0
 
         logging.info("[oi] collecting every %ds, ATM +/- %d strikes", args.interval, args.depth)
+        auth_failures = 0
         while True:
             if in_session():
                 try:
                     n = snapshot(conn, smart_api, builders, latest_spots(smart_api))
                     logging.info("[oi] snapshot: %d rows", n)
+                    auth_failures = 0
+                except AuthLost as e:
+                    auth_failures += 1
+                    if auth_failures >= MAX_AUTH_FAILURES:
+                        logging.critical(
+                            "[oi] session invalidated %d times. Almost certainly "
+                            "contending with main.py for one broker session. "
+                            "Stopping so position management is not disrupted; "
+                            "research data is the lower priority.", auth_failures)
+                        return 0
+                    wait = AUTH_BACKOFF_SEC[auth_failures - 1]
+                    logging.error(
+                        "[oi] session lost (%s). Backing off %ds rather than racing "
+                        "main.py to re-authenticate.", e, wait)
+                    time.sleep(wait)
+                    smart_api = authenticate_broker() or smart_api
+                    continue
                 except Exception as e:
                     logging.error("[oi] snapshot failed: %s", e)
             else:

@@ -309,6 +309,51 @@ enable_choppy_entries             = False
 
 ---
 
+## Running two processes
+
+The bot and the collector run as separate processes against the **same broker
+account**. Two things follow from that.
+
+**API load is not the problem.** Combined sustained rate is ~0.44 calls/sec, of
+which the collector is ~5%:
+
+| Source | Rate |
+|--------|------|
+| Bot: trailing-stop monitor (`ltpData` × open trades / 5s) | 0.400/s |
+| Bot: heartbeat probe | 0.017/s |
+| Collector: spots + chain, every 3 min | 0.022/s |
+
+The endpoint that actually rate-limited us was `getCandleData` (historical),
+which is capped far below the quote endpoints. The collector never touches it —
+it uses `getMarketData`. **The rule that matters is unchanged: never run
+`backtest_data.py` during market hours.**
+
+**Session contention is the real risk.** Each process calls `generateSession`
+independently. If the broker permits only one active session per client id, each
+login invalidates the other's, `SessionKeeper` re-authenticates, and the two
+fight indefinitely — burning TOTP codes and dropping position management at
+arbitrary moments.
+
+Both sides now handle it rather than leaving it to a log grep:
+
+- `SessionKeeper` logs **CRITICAL** when re-auth clusters (3 within 10 minutes),
+  naming the likely cause. A trickle is normal; a burst is not.
+- The collector treats an auth failure as `AuthLost`, backs off **60s → 5m →
+  15m** rather than racing to re-authenticate, and **stops for the session**
+  after three. Research data is the lower priority; position management is not
+  interrupted for it.
+
+**Stagger the starts** — bot first, wait for `Multi-Index Framework fully
+operational`, then the collector. Then check once:
+
+```bash
+grep -c "\[session\] re-authenticated" run_$(date +%F).log
+```
+
+0 or 1 is fine. Climbing means they are contending.
+
+---
+
 ## Concurrency
 
 Ticks arrive on the SmartWebSocketV2 callback thread, and **more than one can be
