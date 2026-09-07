@@ -372,6 +372,11 @@ def main(argv=None):
                         "main.py to re-authenticate.", e, wait)
                     time.sleep(wait)
                     smart_api = authenticate_broker() or smart_api
+                    # Builders cached the old handle at startup. Nothing in the
+                    # collector path calls through them today, but leaving a dead
+                    # session on an object that exposes API methods is a trap.
+                    for b in builders.values():
+                        b.smart_api = smart_api
                     continue
                 except Exception as e:
                     logging.error("[oi] snapshot failed: %s", e)
