@@ -468,6 +468,43 @@ Needs the candle cache current — run `backtest_data.py` after the session.
 
 ---
 
+## Verifying lot sizes
+
+`FALLBACK_LOT_SIZE` in `config.py` holds **order quantities sent to the
+exchange**. A wrong value does not degrade gracefully: the exchange rejects any
+quantity that is not a multiple of the current lot, so every order for that
+index is refused. Paper trading validates nothing, so the fault stays invisible
+until the first real order.
+
+**Never set these from memory.** Lot sizes change by circular, and a
+recollection of one is worth nothing. Read the scrip master:
+
+```bash
+python3 -c "
+import requests, collections
+d = requests.get('https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json', timeout=60).json()
+for idx, exch in (('NIFTY','NFO'), ('SENSEX','BFO'), ('BANKNIFTY','NFO')):
+    c = collections.Counter(str(r.get('lotsize')) for r in d
+        if r.get('exch_seg')==exch and r.get('instrumenttype','').startswith('OPT')
+        and r.get('name')==idx)
+    print(idx, exch, '->', c.most_common(5))
+"
+```
+
+As of **2026-09-08** this is unanimous per index:
+
+| Index | Exchange | Lot | Contracts agreeing |
+|-------|----------|-----|--------------------|
+| NIFTY | NFO | **65** | 1,580 |
+| SENSEX | BFO | **20** | 3,208 |
+| BANKNIFTY | NFO | **30** | 882 |
+
+`LotSizeTests` asserts these. If a lot genuinely changes, re-run the command
+above and update `config.py` and the test together — the test exists to make a
+stale constant fail loudly rather than reach the exchange.
+
+---
+
 ## Multi-timeframe — status
 
 The bot runs on **one** timeframe today. Everything else is built, tested, and

@@ -2796,11 +2796,15 @@ class TimeframeSafetyTests(unittest.TestCase):
 
 class LotSizeTests(unittest.TestCase):
     """Order quantity must be a multiple of the exchange lot, or the order is
-    refused outright. Paper trading validates nothing, so a wrong lot size is
-    invisible until the first real order -- 27 NIFTY trades were recorded at
-    qty=65, which is not and has never been a NIFTY lot."""
+    refused outright, and paper trading validates nothing -- so a wrong lot size
+    stays invisible until the first real order.
 
-    KNOWN = {"NIFTY": 75, "BANKNIFTY": 30, "SENSEX": 20}
+    These values are copied from the Angel One scrip master, not from memory.
+    As of 2026-09-08 it is unanimous: NIFTY 65 (1,580 contracts), SENSEX 20
+    (3,208), BANKNIFTY 30 (882). When a lot genuinely changes, re-run the check
+    in README under "Verifying lot sizes" and update both places together."""
+
+    KNOWN = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20}
 
     def test_fallback_lots_match_the_exchange(self):
         from config import FALLBACK_LOT_SIZE
@@ -2817,7 +2821,7 @@ class LotSizeTests(unittest.TestCase):
         from options_chain_builder import DynamicOptionsChainBuilder
         b = DynamicOptionsChainBuilder.__new__(DynamicOptionsChainBuilder)
         b.index_name = "NIFTY"
-        self.assertEqual(b._lotsize({"lotsize": "75"}), 75)
+        self.assertEqual(b._lotsize({"lotsize": "65"}), 65)
         self.assertEqual(b._lotsize({"lot_size": 50}), 50)
 
     def test_builder_warns_when_it_falls_back(self):
@@ -2827,11 +2831,11 @@ class LotSizeTests(unittest.TestCase):
         b = DynamicOptionsChainBuilder.__new__(DynamicOptionsChainBuilder)
         b.index_name = "NIFTY"
         with self.assertLogs(level="WARNING") as caught:
-            self.assertEqual(b._lotsize({}), 75)
+            self.assertEqual(b._lotsize({}), 65)
         self.assertTrue(any("fallback" in m.lower() for m in caught.output))
 
         with self.assertLogs(level="WARNING") as caught:
-            self.assertEqual(b._lotsize({"lotsize": "not-a-number"}), 75)
+            self.assertEqual(b._lotsize({"lotsize": "not-a-number"}), 65)
         self.assertTrue(any("fallback" in m.lower() for m in caught.output))
 
 
