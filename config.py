@@ -141,14 +141,18 @@ def signal_bar_bucket(now_ts=None):
 # quantity that is not a multiple of the current lot. A wrong number here does
 # not degrade gracefully -- every order for that index is refused.
 #
-# NIFTY was 65 here, which has never been a NIFTY lot size; the lot went 25 ->
-# 50 -> 75 and is 75 today. Paper trading never noticed because nothing
-# validates a paper fill, so 27 NIFTY trades were recorded at qty=65 and every
-# one of them would have been rejected live.
+# VERIFY AGAINST THE SCRIP MASTER, NEVER FROM MEMORY. On 2026-09-08 NIFTY was
+# changed here from 65 to 75 on the recollection that 75 was the current lot.
+# It is not. The scrip master is unanimous across 1,580 NIFTY option contracts:
 #
-# Verify against the exchange circular before changing, not against memory.
+#   NIFTY NFO -> [('65', 1580)]
+#   SENSEX BFO -> [('20', 3208)]
+#   BANKNIFTY NFO -> [('30', 882)]
+#
+# The check that produces that output is in README under "Verifying lot sizes".
+# Run it before touching any value below.
 FALLBACK_LOT_SIZE = {
-    "NIFTY": 75,
+    "NIFTY": 65,
     "BANKNIFTY": 30,
     "SENSEX": 20,
 }

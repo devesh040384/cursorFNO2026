@@ -4,32 +4,37 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
-## 2026-09-08 — NIFTY lot size was 65; the exchange lot is 75 (go-live blocker)
+## 2026-09-08 — Correction: NIFTY lot is 65; the "fix" that changed it was wrong
 
-`FALLBACK_LOT_SIZE["NIFTY"]` was **65**, which has never been a NIFTY lot size —
-the lot went 25 → 50 → 75 and is 75 today. Order quantity must be a multiple of
-the current lot or the exchange refuses the order outright, so **every live
-NIFTY entry would have been rejected**. SENSEX (20) was correct, which is why
-the fault was survivable in paper and invisible in the results.
+Earlier today `FALLBACK_LOT_SIZE["NIFTY"]` was changed from **65 to 75** on the
+claim that 75 was the current exchange lot and that 65 had never been one. That
+claim was made from memory and **it was false**. The Angel One scrip master is
+unanimous across 1,580 NIFTY option contracts:
 
-All 27 NIFTY trades in `trade_history.db` were recorded at `qty=65`. Their
-per-trade percentages are unaffected; their rupee amounts are understated by
-~13%. The verdicts drawn from that data do not change — the signal analysis is
-percentage-based — but the absolute P&L figures are wrong and should not be
-quoted.
+    NIFTY NFO -> [('65', 1580)]
+    SENSEX BFO -> [('20', 3208)]
+    BANKNIFTY NFO -> [('30', 882)]
 
-**The deeper fault was that the fallback was silent.** `_lotsize()` fell through
-to the fallback on every single contract, which means the scrip-master lookup
-was never returning a lot size at all. A silent fallback and a working scrip
-master are indistinguishable from the outside, so nothing surfaced it. The
-fallback now logs a warning naming the index and the value used.
+65 was correct all along. The change shipped to `main` in PR #37 would have had
+the exchange reject **every** live NIFTY order — precisely the failure it
+claimed to prevent. Reverted here, and the test now asserts 65.
 
-Four tests: the fallback table is asserted against the current exchange lots,
-no lot may be non-positive, the scrip master is preferred when present, and the
-fallback path must warn.
+**The reasoning that produced it was also wrong.** The argument was: every NIFTY
+trade recorded `qty=65` with zero variance, therefore the scrip-master lookup
+must be failing and the fallback silently covering it. But the scrip master
+returns 65 and the fallback was 65, so identical output proves nothing about
+which path ran. The evidence was consistent with the code working correctly, and
+was read as a bug only because the lot size was assumed wrong first.
 
-**Paper trading validates nothing.** A wrong lot size costs nothing until the
-first real order, which is precisely when it costs the most.
+**What survives, and is worth keeping:** `_lotsize()` now logs a warning when it
+falls back, naming the index and value. That was defensible independently — a
+silent fallback and a working lookup are genuinely indistinguishable from
+outside — and it is what will actually answer the question the bad reasoning
+tried to answer by inference. Watch for it on the next run.
+
+README gains a **Verifying lot sizes** section with the scrip-master command and
+today's output, so the next person to touch these numbers has a source to check
+against instead of a recollection.
 
 ---
 
