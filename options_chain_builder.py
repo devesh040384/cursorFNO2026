@@ -2,6 +2,7 @@ import logging
 import json
 import os
 from datetime import datetime, timedelta
+
 from config import FALLBACK_LOT_SIZE, RISK
 from ist_time import ist_now
 
@@ -28,11 +29,27 @@ class DynamicOptionsChainBuilder:
         return sym.startswith(self.index_name)
 
     def _lotsize(self, item):
-        raw = item.get("lotsize") or item.get("lot_size") or FALLBACK_LOT_SIZE.get(self.index_name, 0)
+        """Lot size for this contract, from the scrip master where possible.
+
+        The fallback is logged rather than taken silently. Every NIFTY trade in
+        the live database used the fallback and nobody knew, because a silent
+        fallback and a working scrip master look identical from the outside --
+        right up to the point an order is rejected.
+        """
+        raw = item.get("lotsize") or item.get("lot_size")
+        if not raw:
+            fb = int(FALLBACK_LOT_SIZE.get(self.index_name, 0))
+            logging.warning("[%s] scrip master gave no lotsize; using fallback %d. "
+                            "Confirm it matches the current exchange lot.",
+                            self.index_name, fb)
+            return fb
         try:
             return int(float(raw))
         except (TypeError, ValueError):
-            return int(FALLBACK_LOT_SIZE.get(self.index_name, 0))
+            fb = int(FALLBACK_LOT_SIZE.get(self.index_name, 0))
+            logging.warning("[%s] unusable lotsize %r; using fallback %d.",
+                            self.index_name, raw, fb)
+            return fb
 
     @staticmethod
     def _ist_midnight():

@@ -2794,5 +2794,46 @@ class TimeframeSafetyTests(unittest.TestCase):
         self.assertEqual(errors, [], "concurrent access to PendingBook raised")
 
 
+class LotSizeTests(unittest.TestCase):
+    """Order quantity must be a multiple of the exchange lot, or the order is
+    refused outright. Paper trading validates nothing, so a wrong lot size is
+    invisible until the first real order -- 27 NIFTY trades were recorded at
+    qty=65, which is not and has never been a NIFTY lot."""
+
+    KNOWN = {"NIFTY": 75, "BANKNIFTY": 30, "SENSEX": 20}
+
+    def test_fallback_lots_match_the_exchange(self):
+        from config import FALLBACK_LOT_SIZE
+        for index, lot in self.KNOWN.items():
+            self.assertEqual(FALLBACK_LOT_SIZE.get(index), lot,
+                             "%s fallback lot is not the current exchange lot" % index)
+
+    def test_no_fallback_is_zero_or_negative(self):
+        from config import FALLBACK_LOT_SIZE
+        for index, lot in FALLBACK_LOT_SIZE.items():
+            self.assertGreater(int(lot), 0, "%s has a non-positive lot" % index)
+
+    def test_builder_prefers_the_scrip_master(self):
+        from options_chain_builder import DynamicOptionsChainBuilder
+        b = DynamicOptionsChainBuilder.__new__(DynamicOptionsChainBuilder)
+        b.index_name = "NIFTY"
+        self.assertEqual(b._lotsize({"lotsize": "75"}), 75)
+        self.assertEqual(b._lotsize({"lot_size": 50}), 50)
+
+    def test_builder_warns_when_it_falls_back(self):
+        """A silent fallback and a working scrip master look identical from the
+        outside. That is how this went unnoticed for 27 trades."""
+        from options_chain_builder import DynamicOptionsChainBuilder
+        b = DynamicOptionsChainBuilder.__new__(DynamicOptionsChainBuilder)
+        b.index_name = "NIFTY"
+        with self.assertLogs(level="WARNING") as caught:
+            self.assertEqual(b._lotsize({}), 75)
+        self.assertTrue(any("fallback" in m.lower() for m in caught.output))
+
+        with self.assertLogs(level="WARNING") as caught:
+            self.assertEqual(b._lotsize({"lotsize": "not-a-number"}), 75)
+        self.assertTrue(any("fallback" in m.lower() for m in caught.output))
+
+
 if __name__ == "__main__":
     unittest.main()
