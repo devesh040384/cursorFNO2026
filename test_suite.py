@@ -2548,5 +2548,47 @@ class GateStatsTests(unittest.TestCase):
                 self.assertNotIn("return", stripped)
 
 
+
+class LivenessProbeTests(unittest.TestCase):
+    """The probe used getProfile(None), which is not a valid call — it failed
+    every time, so it detected nothing while appearing to."""
+
+    def test_probe_uses_a_call_the_bot_actually_relies_on(self):
+        import io as _io
+        src = _io.open("main.py", encoding="utf-8").read()
+        # Anchor on the CODE, not the comment. The comment explaining why
+        # getProfile was removed legitimately names it, and matching prose is
+        # exactly how the earlier TRADING_PIN grep went wrong.
+        start = src.index("if self.session is not None and ACTIVE_INDICES:")
+        code = "\n".join(line.split("#")[0]
+                         for line in src[start:start + 900].splitlines())
+        self.assertIn("ltpData", code)
+        self.assertNotIn("getProfile", code)
+
+    def test_failed_probe_routes_through_handle_error(self):
+        from broker_health import SessionKeeper
+        calls = []
+        keeper = SessionKeeper(lambda: calls.append(1) or "api", min_interval_sec=0)
+        keeper.ensure()
+        # a non-auth error must not trigger a re-login
+        keeper.handle_error(RuntimeError("connection reset"))
+        self.assertEqual(len(calls), 1)
+        # an auth error must
+        keeper.handle_error(RuntimeError("Invalid Token"))
+        self.assertEqual(len(calls), 2)
+
+
+class CollectorReauthTests(unittest.TestCase):
+    """After a re-auth the builders still held the dead session handle."""
+
+    def test_builders_are_refreshed_after_reauth(self):
+        import io as _io
+        src = _io.open("oi_collector.py", encoding="utf-8").read()
+        block = src[src.index("smart_api = authenticate_broker() or smart_api"):]
+        block = block[:400]
+        self.assertIn("b.smart_api = smart_api", block,
+                      "builders keep a dead session handle after re-auth")
+
+
 if __name__ == "__main__":
     unittest.main()

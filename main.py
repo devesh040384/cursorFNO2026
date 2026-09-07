@@ -96,17 +96,23 @@ class SystemHeartbeatMonitor(threading.Thread):
 
                 from scorecard import heartbeat_line
                 logging.info("💓 [SYSTEM STATUS] " + " || ".join(status_summary) + " || " + heartbeat_line(self.db_manager))
-                # Cheap liveness probe: if the session died, re-auth here rather
-                # than discovering it when an exit needs to fire.
-                if self.session is not None:
-                    try:
-                        probe = self.session.api
-                        if probe is not None:
-                            resp = probe.getProfile(None) if hasattr(probe, "getProfile") else None
+                # Liveness probe. This used to call getProfile(None), which is
+                # not a valid call -- it either raised or returned something
+                # unreadable every single time, so the probe detected nothing
+                # while looking like it did. ltpData on the index is a call the
+                # bot already relies on, so a failure here means the session is
+                # genuinely unusable.
+                if self.session is not None and ACTIVE_INDICES:
+                    probe = self.session.api
+                    if probe is not None:
+                        cfg = INDICES_CONFIG[ACTIVE_INDICES[0]]
+                        try:
+                            resp = probe.ltpData(cfg["exchange"], cfg["symbol"],
+                                                 str(cfg["index_token"]))
                             if isinstance(resp, dict) and not resp.get("status"):
                                 self.session.handle_error(resp.get("message") or resp)
-                    except Exception as e:
-                        self.session.handle_error(e)
+                        except Exception as e:
+                            self.session.handle_error(e)
             except Exception as e:
                 logging.error(f"❌ Error in Heartbeat Monitor: {e}")
 
