@@ -27,6 +27,33 @@ that for an out-of-sample split.
 
 ---
 
+## 2026-09-07 — Higher-timeframe filter, testable before it is built
+
+"Should we add 15-minute candles?" is answerable from the existing cache rather
+than by opinion: 15-min bars aggregate from the 5-min series, so the filter can
+be screened before a line of live code is written.
+
+`signal_lab` gains `volume_breakout_htf` (the live signal, gated on 15-min bias
+agreeing) and `htf_trend` (the bias alone, as a control). Comparing the filtered
+against the unfiltered version is the whole test.
+
+Two implementation details that decide whether the answer is trustworthy:
+
+- `htf_bias` reads only bars that **closed strictly before** the bar it gates.
+  Letting a filter see the bar it is filtering is the standard way a backtest
+  manufactures an edge, so a test tampers with all data at and after the gated
+  bar and asserts the bias is unchanged.
+- Aggregation is cached and looked up by bisect. The first version re-aggregated
+  inside the signal, which is O(n²) over 18,500 bars — minutes per run, and the
+  kind of cost that quietly discourages running the test at all.
+
+**Timing note:** the observed median hold is 4.1 minutes, so a 15-minute bar
+rarely closes during a trade. A higher timeframe here can only act as a slow
+regime gate, never as a trigger. That is a legitimate design, but it should be
+chosen knowingly.
+
+---
+
 ## 2026-09-07 — Entry funnel telemetry
 
 "Can we increase trades per day?" could not be answered, because nothing recorded

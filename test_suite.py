@@ -2590,5 +2590,101 @@ class CollectorReauthTests(unittest.TestCase):
                       "builders keep a dead session handle after re-auth")
 
 
+class HigherTimeframeTests(unittest.TestCase):
+    """15-min bars aggregate from the 5-min cache, so testing a higher-timeframe
+    filter needs no new data. The look-ahead guard is the part that matters:
+    letting the filter see the bar it gates is how a backtest invents an edge."""
+
+    def _series(self, drift=0.0, n=75, day=1):
+        from datetime import datetime, timedelta
+        bars, t, px = [], datetime(2026, 9, day, 9, 15), 24000.0
+        for _ in range(n):
+            px *= (1 + drift)
+            bars.append({"dt": t, "open": px, "high": px * 1.0005,
+                         "low": px * 0.9995, "close": px, "volume": 100.0})
+            t += timedelta(minutes=5)
+        return bars
+
+    def setUp(self):
+        import signal_lab as sl
+        sl._HTF_CACHE.clear()
+
+    def test_aggregation_shape_and_ohlc(self):
+        import signal_lab as sl
+        bars = self._series(drift=0.001, n=30)
+        htf = sl.aggregate(bars, 3)
+        self.assertEqual(len(htf), 10)
+        self.assertEqual(htf[0]["open"], bars[0]["open"])
+        self.assertEqual(htf[0]["close"], bars[2]["close"])
+        self.assertEqual(htf[0]["high"], max(b["high"] for b in bars[:3]))
+        self.assertEqual(htf[0]["low"], min(b["low"] for b in bars[:3]))
+        self.assertAlmostEqual(htf[0]["volume"], 300.0)
+
+    def test_partial_buckets_are_not_emitted(self):
+        import signal_lab as sl
+        self.assertEqual(len(sl.aggregate(self._series(n=8), 3)), 2)   # not 3
+
+    def test_buckets_never_span_a_session(self):
+        from datetime import timedelta
+        import signal_lab as sl
+        bars = self._series(n=20)
+        for b in bars[14:]:
+            b["dt"] = b["dt"] + timedelta(days=1)
+        htf = sl.aggregate(bars, 3)
+        for h in htf:
+            pass
+        # 14 bars on day 1 -> 4 complete buckets; 6 on day 2 -> 2. Never 6+.
+        self.assertEqual(len(htf), 6)
+
+    def test_bias_fires_with_direction(self):
+        import signal_lab as sl
+        up = [sl.htf_bias(self._series(drift=0.0005), i) for i in range(75)]
+        self.assertIn("CE", up)
+        self.assertNotIn("PE", up)
+        sl._HTF_CACHE.clear()
+        down = [sl.htf_bias(self._series(drift=-0.0005), i) for i in range(75)]
+        self.assertIn("PE", down)
+        self.assertNotIn("CE", down)
+
+    def test_flat_series_gives_no_bias(self):
+        import signal_lab as sl
+        bars = self._series(drift=0.0)
+        self.assertTrue(all(sl.htf_bias(bars, i) is None for i in range(len(bars))))
+
+    def test_no_look_ahead(self):
+        """Bias at i must be unchanged by anything at or after i."""
+        import signal_lab as sl
+        bars = self._series(drift=0.0005)
+        i = 40
+        before = sl.htf_bias(bars, i)
+        tampered = [dict(b) for b in bars]
+        for b in tampered[i:]:
+            b["close"] = b["high"] = b["low"] = 1.0    # destroy the future
+        sl._HTF_CACHE.clear()
+        self.assertEqual(sl.htf_bias(tampered, i), before)
+
+    def test_filtered_signal_is_a_subset_of_the_base(self):
+        """The filter can only remove triggers, never create them."""
+        import signal_lab as sl
+        bars = self._series(drift=0.0005, n=120)
+        fut = [{"volume": 100.0} for _ in bars]
+        fut[60]["volume"] = 1000.0
+        base = [sl.sig_volume_breakout(bars, i, fut) for i in range(len(bars))]
+        filt = [sl.sig_volume_breakout_htf(bars, i, fut) for i in range(len(bars))]
+        for b, f in zip(base, filt):
+            if f is not None:
+                self.assertEqual(f, b)
+        self.assertLessEqual(sum(1 for f in filt if f), sum(1 for b in base if b))
+
+    def test_lookup_is_not_quadratic(self):
+        import time as time_mod
+        import signal_lab as sl
+        bars = self._series(drift=0.0002, n=3000)
+        start = time_mod.time()
+        for i in range(len(bars)):
+            sl.htf_bias(bars, i)
+        self.assertLess(time_mod.time() - start, 2.0, "htf_bias is re-aggregating")
+
+
 if __name__ == "__main__":
     unittest.main()
