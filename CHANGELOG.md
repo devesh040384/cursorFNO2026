@@ -4,6 +4,35 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-08 — NIFTY lot size was 65; the exchange lot is 75 (go-live blocker)
+
+`FALLBACK_LOT_SIZE["NIFTY"]` was **65**, which has never been a NIFTY lot size —
+the lot went 25 → 50 → 75 and is 75 today. Order quantity must be a multiple of
+the current lot or the exchange refuses the order outright, so **every live
+NIFTY entry would have been rejected**. SENSEX (20) was correct, which is why
+the fault was survivable in paper and invisible in the results.
+
+All 27 NIFTY trades in `trade_history.db` were recorded at `qty=65`. Their
+per-trade percentages are unaffected; their rupee amounts are understated by
+~13%. The verdicts drawn from that data do not change — the signal analysis is
+percentage-based — but the absolute P&L figures are wrong and should not be
+quoted.
+
+**The deeper fault was that the fallback was silent.** `_lotsize()` fell through
+to the fallback on every single contract, which means the scrip-master lookup
+was never returning a lot size at all. A silent fallback and a working scrip
+master are indistinguishable from the outside, so nothing surfaced it. The
+fallback now logs a warning naming the index and the value used.
+
+Four tests: the fallback table is asserted against the current exchange lots,
+no lot may be non-positive, the scrip master is preferred when present, and the
+fallback path must warn.
+
+**Paper trading validates nothing.** A wrong lot size costs nothing until the
+first real order, which is precisely when it costs the most.
+
+---
+
 ## 2026-09-08 — Multi-timeframe audit: three latent faults fixed while inert
 
 **MTF status, stated plainly.** The bot trades on the 5-minute bar and nothing

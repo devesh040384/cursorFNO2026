@@ -135,9 +135,20 @@ def signal_bar_bucket(now_ts=None):
     return secs // bar
 
 
-# Fallback lot sizes if scrip master omits lotsize (must match current NSE/BSE lots)
+# Fallback lot sizes if scrip master omits lotsize.
+#
+# These are ORDER QUANTITIES sent to the exchange, and the exchange rejects any
+# quantity that is not a multiple of the current lot. A wrong number here does
+# not degrade gracefully -- every order for that index is refused.
+#
+# NIFTY was 65 here, which has never been a NIFTY lot size; the lot went 25 ->
+# 50 -> 75 and is 75 today. Paper trading never noticed because nothing
+# validates a paper fill, so 27 NIFTY trades were recorded at qty=65 and every
+# one of them would have been rejected live.
+#
+# Verify against the exchange circular before changing, not against memory.
 FALLBACK_LOT_SIZE = {
-    "NIFTY": 65,
+    "NIFTY": 75,
     "BANKNIFTY": 30,
     "SENSEX": 20,
 }
