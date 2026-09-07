@@ -2463,5 +2463,90 @@ class CollectorYieldsTests(unittest.TestCase):
         self.assertGreaterEqual(oc.AUTH_BACKOFF_SEC[0], 60)
 
 
+
+class GateStatsTests(unittest.TestCase):
+    """The funnel exists because 'raise the daily cap' was the wrong answer to
+    'why so few trades' — nothing recorded where candidates were actually lost."""
+
+    def setUp(self):
+        import gate_stats
+        gate_stats.reset()
+
+    def tearDown(self):
+        import gate_stats
+        gate_stats.reset()
+
+    def test_bump_and_snapshot(self):
+        import gate_stats
+        gate_stats.bump("signal_fired", 5)
+        gate_stats.bump("entry_placed")
+        self.assertEqual(gate_stats.snapshot()["signal_fired"], 5)
+        self.assertEqual(gate_stats.snapshot()["entry_placed"], 1)
+
+    def test_bar_and_signal_stages_are_reported_separately(self):
+        """Mixing the denominators produced a '207% of fired' row."""
+        import gate_stats
+        gate_stats.bump("outside_session", 1428)
+        gate_stats.bump("signal_fired", 100)
+        gate_stats.bump("entry_placed", 26)
+        text = "\n".join(gate_stats.funnel())
+        self.assertIn("bar-level gates", text)
+        self.assertIn("signal-level funnel", text)
+        # the bar-level count must not be expressed as a share of signals
+        bar_line = [l for l in text.splitlines() if "outside_session" in l][0]
+        self.assertNotIn("%", bar_line)
+
+    def test_conversion_and_largest_rejector(self):
+        import gate_stats
+        gate_stats.bump("signal_fired", 100)
+        gate_stats.bump("notional_above_cap", 40)
+        gate_stats.bump("direction_mismatch", 30)
+        gate_stats.bump("entry_placed", 26)
+        text = "\n".join(gate_stats.funnel())
+        self.assertIn("CONVERSION", text)
+        self.assertIn("26.0%", text)
+        self.assertIn("largest single rejector: notional_above_cap", text)
+
+    def test_no_signals_does_not_divide_by_zero(self):
+        import gate_stats
+        gate_stats.bump("outside_session", 3)
+        self.assertIsInstance(gate_stats.funnel(), list)
+
+    def test_bump_never_raises(self):
+        import gate_stats
+        gate_stats.bump(None)
+        gate_stats.bump("unknown_stage")   # not in STAGES; must not blow up
+
+    def test_counters_are_thread_safe(self):
+        import gate_stats
+        def hammer():
+            for _ in range(500):
+                gate_stats.bump("signal_fired")
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(gate_stats.snapshot()["signal_fired"], 2000)
+
+    def test_instrumentation_does_not_change_entry_behaviour(self):
+        """Every bump sits beside a return that already existed."""
+        import gate_stats
+        import io as _io
+        for path in ("strategy_brain.py", "risk_manager.py"):
+            src = _io.open(path, encoding="utf-8").read()
+            self.assertIn("gate_stats.bump", src)
+            # A bump must never be load-bearing for control flow. A ternary
+            # inside its argument only selects which counter, so that is fine;
+            # what matters is that the statement is never a branch or a return.
+            for line in src.splitlines():
+                if "gate_stats.bump" not in line:
+                    continue
+                stripped = line.strip()
+                self.assertTrue(stripped.startswith("gate_stats.bump("),
+                                "bump is not a standalone statement: %s" % stripped)
+                self.assertNotIn("return", stripped)
+
+
 if __name__ == "__main__":
     unittest.main()

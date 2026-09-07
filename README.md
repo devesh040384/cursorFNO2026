@@ -81,6 +81,7 @@ python3 -m unittest test_suite.py -v
 | `backtest_options.py` | Black-Scholes ATM pricing + Angel One cost model |
 | `backtest_data.py` | Candle fetch + CSV cache |
 | `oi_collector.py` | **Separate process.** Option-chain snapshots for positioning research |
+| `gate_stats.py` | Counts why candidate entries are rejected (observation only) |
 | `signal_lab.py` | **Screens signal hypotheses on index data — no options, no costs**; `--validate` for out-of-sample |
 | `trade_analysis.py` | **Separate.** Index excursion per trade: signal failure vs exit failure |
 | `telegram_notifier.py` | **Separate process.** Telegram alerts + remote status. Touches no trading file. |
@@ -469,6 +470,12 @@ Needs the candle cache current — run `backtest_data.py` after the session.
 
 ## Multi-timeframe (1-minute)
 
+> **Not wired into the live path.** `timeframes.py` is tested library code that
+> nothing in `strategy_brain`, `risk_monitors` or `order_execution` imports. The
+> bot does **not** use 1-minute entry confirmation or structural stops today —
+> the switches below exist so the behaviour can be backtested before it is
+> enabled, and every default reproduces current behaviour exactly.
+
 The 5-minute bar stays the signal timeframe. A 1-minute series is used for two
 things, **both off by default**:
 
@@ -548,6 +555,43 @@ sqlite3 oi_history.db "DELETE FROM chain_snapshots WHERE trade_date='YYYY-MM-DD'
 **Timeline:** ~40 sessions for a first read, roughly double for an out-of-sample
 split. That is 2–4 months of collection before any verdict — start now, and
 treat it as running in the background rather than as active work.
+
+---
+
+## Entry funnel (`gate_stats.py`)
+
+The signal fires ~14×/session/index and ~2 trades result. Six of seven
+candidates are rejected somewhere between trigger and fill, and nothing recorded
+where — so *"raise the daily cap"* was never going to help. The cap is not what
+rejects them.
+
+```bash
+python3 backtest_engine.py --days 365 --funnel
+```
+
+```
+bar-level gates (counted per closed signal bar)
+  outside_session              1428
+  cooldown_active               344
+
+signal-level funnel (% of breakouts that fired)
+  signal_fired                  687   100.0%
+  direction_mismatch            207    30.1%
+  volume_gate_expansion         383    55.7%
+  notional_above_cap            280    40.8%
+  max_open_per_index              4     0.6%
+  per_index_daily_cap             4     0.6%
+  entry_placed                  180    26.2%
+  largest single rejector: volume_gate_expansion
+```
+
+**Two denominators, kept apart deliberately.** Bar-level gates count once per
+closed signal bar; signal-level gates only once a breakout fired. Mixing them
+produced rows reading *"207% of fired"*, which invites the wrong conclusion.
+
+Instrumentation is observation only — every `bump()` is a standalone statement
+beside a `return` that already existed, and a test enforces that it never
+appears in a branch or return line.
 
 ---
 

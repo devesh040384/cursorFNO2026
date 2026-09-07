@@ -29,6 +29,7 @@ from datetime import datetime, timedelta
 
 import backtest_data as bd
 import backtest_options as bo
+import gate_stats
 from config import FALLBACK_LOT_SIZE, INDICES_CONFIG, RISK, history_token
 
 MARKET_OPEN_MIN = 9 * 60 + 15
@@ -308,6 +309,7 @@ class Backtest:
         logging.info("replaying %d sessions, IV %s", len(all_days),
                      {k: "%.1f%%" % (100 * v) for k, v in self.iv.items()})
 
+        gate_stats.reset()
         fd, self._db_path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         self._install()
@@ -458,6 +460,8 @@ def main(argv=None):
                         help="override implied vol, e.g. --iv NIFTY=13.1 SENSEX=8.2 "
                              "(calibrated from real fills; default is realised vol)")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--funnel", action="store_true",
+                        help="show why candidate entries were rejected")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,

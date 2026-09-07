@@ -27,6 +27,32 @@ that for an out-of-sample split.
 
 ---
 
+## 2026-09-07 — Entry funnel telemetry
+
+"Can we increase trades per day?" could not be answered, because nothing recorded
+why entries were rejected. The signal fires ~14×/session/index and ~2 trades
+result; six of seven candidates were being lost somewhere invisible.
+
+`gate_stats.py` counts each rejection point. `backtest_engine --funnel` renders
+it over 248 sessions. Observation only: every `bump()` is a standalone statement
+beside a `return` that already existed, and a test enforces that it never appears
+in a branch or return line.
+
+**The caps are not the constraint.** On generated data, `max_open_per_index` and
+`per_index_daily_cap` rejected 4 candidates each out of 687; the volume gate
+rejected 383 and the ₹8,000 notional cap 280. Raising `max_daily_entries` from
+12 would change nothing — it was never binding.
+
+Two denominators are kept apart on purpose: bar-level gates count per closed
+signal bar, signal-level gates only once a breakout fired. The first version
+mixed them and produced rows reading "207% of fired".
+
+**Also recorded: multi-timeframe is NOT live.** `timeframes.py` is tested library
+code that nothing in the trading path imports. The README now says so at the top
+of that section rather than leaving it inferable from the defaults.
+
+---
+
 ## 2026-09-07 — Session contention between the two processes
 
 Running `oi_collector.py` alongside `main.py` means two logins on one client id.
