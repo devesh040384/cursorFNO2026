@@ -1,4 +1,5 @@
 import logging
+import gate_stats
 from config import FALLBACK_LOT_SIZE, RISK, daily_entry_cap, index_daily_entry_cap
 
 
@@ -76,6 +77,7 @@ class RiskManager:
     def assess_order_safety(self, order_proposal: dict, estimated_premium: float = 0.0) -> bool:
         self.refresh_from_db()
         if self.trading_halted:
+            gate_stats.bump("trading_halted")
             logging.warning("RiskManager blocked entry: trading halted.")
             return False
 
@@ -84,12 +86,15 @@ class RiskManager:
 
         index_name = order_proposal.get("index_name")
         if self.db.count_open_trades() >= RISK["max_open_total"]:
+            gate_stats.bump("max_open_total")
             logging.info("RiskManager blocked entry: max open trades reached.")
             return False
         if index_name and self.db.count_open_trades(index_name) >= RISK["max_open_per_index"]:
+            gate_stats.bump("max_open_per_index")
             logging.info(f"RiskManager blocked entry: {index_name} already has an OPEN trade.")
             return False
         if self.db.count_entries_today() >= daily_entry_cap():
+            gate_stats.bump("daily_cap")
             logging.info(
                 f"RiskManager blocked entry: daily entry cap reached "
                 f"({self.db.count_entries_today()}/{daily_entry_cap()})."
@@ -100,6 +105,7 @@ class RiskManager:
             idx_n = self.db.count_entries_today(index_name=index_name)
             idx_cap = index_daily_entry_cap()
             if idx_n >= idx_cap:
+                gate_stats.bump("per_index_daily_cap")
                 logging.info(
                     f"RiskManager blocked entry: {index_name} per-index daily cap "
                     f"reached ({idx_n}/{idx_cap})."
@@ -112,6 +118,7 @@ class RiskManager:
             trend_cap = int(RISK.get("max_trend_entries_per_day", daily_entry_cap()))
             trend_n = self.db.count_entries_today(entry_reasons=trend_reasons)
             if trend_n >= trend_cap:
+                gate_stats.bump("trend_soft_cap")
                 logging.info(
                     f"RiskManager blocked {reason}: trend soft-cap "
                     f"{trend_n}/{trend_cap} (VOLUME_BREAKOUT still allowed)."
@@ -121,9 +128,11 @@ class RiskManager:
         qty = int(order_proposal.get("qty") or 0)
         premium = float(estimated_premium or 0.0)
         if premium < RISK["min_option_premium"]:
+            gate_stats.bump("premium_below_min")
             logging.info(f"RiskManager blocked entry: premium ₹{premium} below min.")
             return False
         if qty > 0 and premium * qty > RISK["max_premium_risk_inr"]:
+            gate_stats.bump("notional_above_cap")
             logging.info(
                 f"RiskManager blocked entry: notional ₹{premium * qty:.0f} exceeds cap."
             )

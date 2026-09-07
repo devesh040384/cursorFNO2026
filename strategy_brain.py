@@ -3,6 +3,7 @@ import time
 import json
 import os
 import logging
+import gate_stats
 from config import FALLBACK_LOT_SIZE, INDICES_CONFIG, RISK, signal_bar_bucket, signal_bar_sec
 from ist_time import ist_hhmm, ist_today
 from risk_manager import RiskManager
@@ -390,6 +391,7 @@ class StrategyBrain:
 
             contract = builder.get_nearest_expiry_contract(spot_price, instrument_type=option_type)
             if not contract:
+                gate_stats.bump("no_contract_for_dte")
                 return False
 
             opt_symbol = contract.get("symbol")
@@ -404,6 +406,7 @@ class StrategyBrain:
 
             ltp_resp = self.order_manager.smart_api.ltpData(exchange, opt_symbol, opt_token)
             if not (ltp_resp and ltp_resp.get("status") and ltp_resp.get("data")):
+                gate_stats.bump("no_ltp")
                 return False
             opt_ltp = float(ltp_resp["data"]["ltp"])
 
@@ -412,6 +415,7 @@ class StrategyBrain:
             with ENTRY_LOCK:
                 bucket = signal_bar_bucket(time.time())
                 if self.last_entry_bucket.get(symbol) == bucket:
+                    gate_stats.bump("same_bar_duplicate")
                     logging.info(
                         f"[{symbol}] Entry suppressed: already entered on this signal bar."
                     )
@@ -453,6 +457,7 @@ class StrategyBrain:
                     spread_pct=contract.get("spread_pct"),
                 )
                 if order_id:
+                    gate_stats.bump("entry_placed")
                     # Claim the bar even on a broker failure path below, so a
                     # retry cannot double up within the same signal bar.
                     self.last_entry_bucket[symbol] = bucket
@@ -486,6 +491,7 @@ class StrategyBrain:
             return False
         if not self.volume_gate.has_fresh_breakout(symbol):
             return False
+        gate_stats.bump("signal_fired")
         up_bar = last_close > prev_close
         down_bar = last_close < prev_close
         allow_chop = RISK.get("enable_volume_breakout_in_chop", True)
@@ -493,6 +499,7 @@ class StrategyBrain:
         want_pe = (macro_trend == "BEARISH" or (macro_trend == "CHOPPY" and allow_chop)) and down_bar
         if not want_ce and not want_pe:
             self.volume_gate.consume_breakout(symbol)
+            gate_stats.bump("direction_mismatch")
             logging.info(
                 f"[{symbol}] VOLUME_BREAKOUT skipped: bar direction does not match {macro_trend}."
             )
@@ -533,6 +540,8 @@ class StrategyBrain:
             if not self._volume_ok_for_reason(symbol, reason):
                 snap = self.volume_gate.snapshot(symbol)
                 need = "expansion" if reason == "TREND_CONT" else "hook"
+                gate_stats.bump("volume_gate_expansion" if reason == "TREND_CONT"
+                                else "volume_gate_hook")
                 logging.info(f"[{symbol}] CE {reason} skipped ({need}): {snap['reason']}")
                 return False
             logging.info(f"[{symbol}] Closed-bar CE ({reason}): trend up rsi={current_rsi:.1f}")
@@ -551,6 +560,8 @@ class StrategyBrain:
             if not self._volume_ok_for_reason(symbol, reason):
                 snap = self.volume_gate.snapshot(symbol)
                 need = "expansion" if reason == "TREND_CONT" else "hook"
+                gate_stats.bump("volume_gate_expansion" if reason == "TREND_CONT"
+                                else "volume_gate_hook")
                 logging.info(f"[{symbol}] PE {reason} skipped ({need}): {snap['reason']}")
                 return False
             logging.info(f"[{symbol}] Closed-bar PE ({reason}): trend down rsi={current_rsi:.1f}")
@@ -654,12 +665,14 @@ class StrategyBrain:
 
         if current_hour_min < RISK["session_start_hhmm"] or current_hour_min >= RISK["entry_cutoff_hhmm"]:
             if closed_bar:
+                gate_stats.bump("outside_session")
                 self.last_closed_rsi[symbol] = current_rsi
                 self._save_state()
             return
 
         if current_time < self.cooldown_until.get(symbol, 0.0):
             if closed_bar:
+                gate_stats.bump("cooldown_active")
                 self.last_closed_rsi[symbol] = current_rsi
             return
 
@@ -667,6 +680,7 @@ class StrategyBrain:
             return
 
         if self.stale_bars.get(symbol, 0) > 0:
+            gate_stats.bump("stale_bars_pause")
             self.stale_bars[symbol] -= 1
             logging.info(
                 f"[{symbol}] Entry paused: rebuilding after feed gap "
