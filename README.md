@@ -654,6 +654,32 @@ the recent period is null. A regime artifact, not an edge.
 
 `--since` / `--until` screen a specific window directly.
 
+### Higher timeframe (15-minute)
+
+15-minute bars aggregate from the 5-minute cache, so testing a higher-timeframe
+filter needs **no new data**:
+
+```bash
+python3 signal_lab.py --signals volume_breakout volume_breakout_htf htf_trend
+```
+
+- `volume_breakout` — the live signal, unfiltered
+- `volume_breakout_htf` — the same signal, only when the 15-min bias agrees
+- `htf_trend` — the 15-min bias alone, as a control
+
+If the filtered version does not beat the unfiltered one, a 15-minute timeframe
+adds only state, complexity and another surface for the concurrency bugs already
+found three times.
+
+`htf_bias` reads only bars that **closed strictly before** the bar it gates —
+letting a filter see the bar it is filtering is the classic way a backtest
+invents an edge. Aggregation is cached and looked up by bisect; the first version
+re-aggregated per bar and was O(n²) over 18,500 bars.
+
+---
+
+
+
 ### Judging an edge against an instrument
 
 ```bash
