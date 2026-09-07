@@ -20,6 +20,7 @@ All of it is inert unless `RISK["entry_timing"]` / `RISK["stop_mode"]` are moved
 off their defaults, which reproduce today's behaviour exactly.
 """
 import logging
+import threading
 
 from config import RISK
 
@@ -97,9 +98,17 @@ class MinuteBars:
 
         For a long call that is the previous 1-minute low; for a long put, the
         previous 1-minute high.
+
+        Returns None when the last closed bar is not the minute immediately
+        before the forming one. After a feed gap the newest "closed" bar can be
+        twenty minutes old, and a structural stop placed at a stale pivot is
+        either already breached or so far away it is not a stop at all. A gap
+        means we have no pivot, not an old one.
         """
         bar = self.last_closed
         if bar is None:
+            return None
+        if self.cur_minute is None or bar["minute"] != self.cur_minute - 1:
             return None
         return bar["low"] if is_call else bar["high"]
 
@@ -196,6 +205,11 @@ class PendingBook:
 
     def __init__(self):
         self.pending = {}
+        # `arm` is called from the strategy thread on a 5-minute bar close;
+        # `on_minute_close` and `sweep_expired` from the websocket and monitor
+        # threads. Every other module with shared state in this repo takes a
+        # lock (ENTRY_LOCK, STATE_LOCK, gate_stats); this one did not.
+        self._lock = threading.Lock()
 
     def arm(self, symbol, side, reason, signal_price, now_minute, bars):
         """Hold a signal for confirmation. Returns True if it was held.
@@ -211,30 +225,60 @@ class PendingBook:
             logging.info("[%s] %s: no 1m history for a %s trigger; entering immediately.",
                          symbol, reason, entry_timing())
             return False
-        self.pending[symbol] = PendingEntry(symbol, side, reason, signal_price, now_minute, trigger)
+        with self._lock:
+            self.pending[symbol] = PendingEntry(symbol, side, reason, signal_price,
+                                                now_minute, trigger)
         logging.info("[%s] %s armed (%s): waiting for %.2f within %dm",
                      symbol, reason, entry_timing(), trigger, confirm_window_min())
         return True
 
     def on_minute_close(self, symbol, bar, now_minute):
-        """Returns the PendingEntry to fill now, or None. Expired ones are dropped."""
-        entry = self.pending.get(symbol)
-        if entry is None:
+        """Returns the PendingEntry to fill now, or None. Expired ones are dropped.
+
+        Expiry is tested BEFORE confirmation. The other order lets a bar that
+        arrives after the window still fill the entry, which quietly makes
+        `confirm_window_min` one minute longer than it says it is.
+        """
+        with self._lock:
+            entry = self.pending.get(symbol)
+            if entry is None:
+                return None
+            if entry.expired(now_minute):
+                self.pending.pop(symbol, None)
+                logging.info("[%s] %s dropped: no confirmation within %dm.",
+                             symbol, entry.reason, confirm_window_min())
+                return None
+            entry.bars_seen += 1
+            if entry.confirmed(bar):
+                self.pending.pop(symbol, None)
+                logging.info("[%s] %s confirmed after %d 1m bar(s).",
+                             symbol, entry.reason, entry.bars_seen)
+                return entry
             return None
-        entry.bars_seen += 1
-        if entry.confirmed(bar):
-            self.pending.pop(symbol, None)
-            logging.info("[%s] %s confirmed after %d 1m bar(s).",
-                         symbol, entry.reason, entry.bars_seen)
-            return entry
-        if entry.expired(now_minute):
-            self.pending.pop(symbol, None)
-            logging.info("[%s] %s dropped: no confirmation within %dm.",
-                         symbol, entry.reason, confirm_window_min())
-        return None
+
+    def sweep_expired(self, now_minute):
+        """Drop entries whose window has passed, without needing a bar close.
+
+        `on_minute_close` only runs when a minute actually closes, and a minute
+        only closes when a tick arrives. If the feed stalls, an armed entry
+        would sit in the book indefinitely — through the close and into the
+        next session — and fill on the first tick of the following morning.
+        Call this from the same place that already runs on a timer.
+        """
+        dropped = []
+        with self._lock:
+            for symbol, entry in list(self.pending.items()):
+                if entry.expired(now_minute):
+                    self.pending.pop(symbol, None)
+                    dropped.append((symbol, entry.reason))
+        for symbol, reason in dropped:
+            logging.info("[%s] %s dropped: window elapsed with no 1m close.",
+                         symbol, reason)
+        return len(dropped)
 
     def clear(self, symbol=None):
-        if symbol is None:
-            self.pending.clear()
-        else:
-            self.pending.pop(symbol, None)
+        with self._lock:
+            if symbol is None:
+                self.pending.clear()
+            else:
+                self.pending.pop(symbol, None)
