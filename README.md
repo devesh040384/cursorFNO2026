@@ -73,7 +73,7 @@ python3 -m unittest test_suite.py -v
 | `database.py` | SQLite `trade_history.db` (WAL) |
 | `scorecard.py` | PnL / win-rate from stored qty |
 | `history_seeder.py` | Seeds 5-min bar history from broker candles at startup |
-| `timeframes.py` | 1-min entry confirmation + structural stops (**inert by default**) |
+| `timeframes.py` | 1-min entry confirmation + structural stops (**inert — imported by no trading file**) |
 | `ist_time.py` | Single source of IST wall-clock (all dates/stamps) |
 | `broker_orders.py` | Confirms real fills from the order book (never assumes) |
 | `broker_health.py` | Session re-auth, log rotation, CRITICAL alerting |
@@ -468,6 +468,32 @@ Needs the candle cache current — run `backtest_data.py` after the session.
 
 ---
 
+## Multi-timeframe — status
+
+The bot runs on **one** timeframe today. Everything else is built, tested, and
+switched off. Stated plainly because "MTF is implemented" and "MTF is running"
+are different claims and only the first is true:
+
+| Timeframe | Where | Status | Reads it in live trading? |
+|-----------|-------|--------|---------------------------|
+| **5-min** | `strategy_brain.py` | **LIVE** — regime, RVOL, breakout, entries, exits | **Yes.** The only one. |
+| **1-min** | `timeframes.py` | Built, 20 tests, config knobs present, all defaults inert | **No** — imported by `test_suite.py` and nothing else |
+| **15-min** | `signal_lab.py` | Research only — `aggregate`, `htf_bias`, two filtered signals | **No** — never touches the trading path |
+
+Verify it yourself, at any time:
+
+```bash
+grep -rn "import timeframes" --include=*.py . | grep -v test_suite
+```
+
+Empty output means MTF is not wired. That is the current, expected result.
+
+**What "wired" would require** — three call sites that do not exist yet:
+`MinuteBars.update()` on every index tick, `PendingBook.on_minute_close()` where
+the fill decision is made, and `PendingBook.clear()` at the session close.
+
+---
+
 ## Multi-timeframe (1-minute)
 
 > **Not wired into the live path.** `timeframes.py` is tested library code that
@@ -501,6 +527,23 @@ question, not an argument.
 Everything works on the **index**, never the option: the bot subscribes to index
 ticks continuously but never to option ticks, so a 1-min option series does not
 exist before entry.
+
+**Safety properties, enforced by test.** These were fixed on 2026-09-08 while
+the module was still inert — the cheapest possible time to find them:
+
+- **A pivot is never taken across a feed gap.** `MinuteBars.pivot()` returns
+  `None` unless the last closed bar is the minute immediately before the forming
+  one. After an outage the newest "closed" bar can be twenty minutes old, and a
+  structural stop placed there is either already breached or so far away it is
+  not a stop.
+- **`confirm_window_min` means what it says.** Expiry is tested before
+  confirmation, so a bar arriving after the window cannot still fill the entry.
+- **A stalled feed cannot leave an entry armed overnight.** `on_minute_close`
+  only runs when a minute closes, and a minute only closes when a tick arrives.
+  `sweep_expired(now_minute)` drops stale entries on a timer instead.
+- **`PendingBook` is locked.** `arm()` is called from the strategy thread,
+  `on_minute_close()` and `sweep_expired()` from the websocket and monitor
+  threads.
 
 Cache 1-minute candles with:
 

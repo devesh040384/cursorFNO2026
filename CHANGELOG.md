@@ -4,6 +4,49 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-08 — Multi-timeframe audit: three latent faults fixed while inert
+
+**MTF status, stated plainly.** The bot trades on the 5-minute bar and nothing
+else. `timeframes.py` (1-min) is complete and tested but imported by no trading
+file; `signal_lab.py` (15-min) is research-only. "Implemented" is true;
+"running" is not. `grep -rn "import timeframes" --include=*.py . | grep -v
+test_suite` returns nothing, and that is the expected result.
+
+Auditing it found three faults that are invisible today and would have been
+live the moment `entry_timing` or `stop_mode` moved off its default — which is
+precisely when nobody would be looking for them.
+
+**Stale pivot across a feed gap.** `MinuteBars` appends a closed bar whenever
+the minute index changes, gap or no gap, so after an outage `pivot()` returned a
+bar that could be twenty minutes old. A `structural_1m` stop built there is
+either already breached at entry or so distant it is not a stop. `pivot()` now
+returns `None` unless the last closed bar is the minute immediately before the
+forming one. **A gap means we have no pivot, not an old one.**
+
+**`confirm_window_min` was one minute longer than it said.** `on_minute_close`
+tested confirmation before expiry, so a bar arriving after the window still
+filled the entry. Expiry is now tested first.
+
+**A stalled feed left entries armed indefinitely.** Expiry was only ever checked
+inside `on_minute_close`, which runs only when a minute closes, which happens
+only when a tick arrives. An entry armed at 15:29 would survive the close and
+fill on the first tick of the next session. Added `sweep_expired(now_minute)`
+for the timer path.
+
+**`PendingBook` had no lock** — the only shared-state module in the repo without
+one. `arm()` runs on the strategy thread; `on_minute_close()` and
+`sweep_expired()` on the websocket and monitor threads.
+
+20 tests on `timeframes.py` (was 14). Five of the six new ones fail against the
+previous code; the sixth is the control that must pass either way. **No live
+behaviour changed** — the module is still inert, and every default still
+reproduces current behaviour exactly.
+
+Also noted, not changed: `trading_bot.py` and `instrument_engine.py` are
+imported by nothing. They are dead files that read like live ones.
+
+---
+
 ## 2026-09-03 — Option-chain collector (positioning research)
 
 Price and volume signals are exhausted: six screened, all null, all 2.4–4.9×

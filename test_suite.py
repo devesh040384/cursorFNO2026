@@ -2686,5 +2686,113 @@ class HigherTimeframeTests(unittest.TestCase):
         self.assertLess(time_mod.time() - start, 2.0, "htf_bias is re-aggregating")
 
 
+class TimeframeSafetyTests(unittest.TestCase):
+    """Three latent faults in timeframes.py. All are invisible today because the
+    module is inert; all are live the moment entry_timing or stop_mode moves off
+    its default, which is exactly when nobody would be looking for them."""
+
+    def setUp(self):
+        import timeframes as tf
+        from config import RISK
+        self._saved = dict(RISK)
+        self.tf = tf
+
+    def tearDown(self):
+        from config import RISK
+        RISK.clear()
+        RISK.update(self._saved)
+
+    def _bars(self, minutes):
+        """MinuteBars fed a specific sequence of minute indices."""
+        bars = self.tf.MinuteBars()
+        for m in minutes:
+            bars.update(m, 100.0 + m)
+        return bars
+
+    def test_pivot_is_none_after_a_feed_gap(self):
+        """A structural stop taken from a 20-minute-old pivot is not a stop."""
+        contiguous = self._bars([1, 2, 3])
+        self.assertIsNotNone(contiguous.pivot(True))
+        gapped = self._bars([1, 2, 25])       # minute 3..24 never arrived
+        self.assertIsNotNone(gapped.last_closed)   # a bar did close
+        self.assertIsNone(gapped.pivot(True),
+                          "pivot returned a stale bar across a feed gap")
+        self.assertIsNone(gapped.pivot(False))
+
+    def test_structural_stop_declines_a_stale_pivot(self):
+        from config import RISK
+        RISK["stop_mode"] = self.tf.STRUCTURAL_1M
+        gapped = self._bars([1, 2, 25])
+        self.assertIsNone(
+            self.tf.structural_stop_level(True, gapped, 10_000.0),
+            "structural stop built on a pivot from before the gap")
+
+    def test_expiry_beats_a_late_confirmation(self):
+        """confirm_window_min=3 must mean 3, not 'about 3'."""
+        from config import RISK
+        RISK["entry_timing"] = self.tf.CONTINUATION
+        RISK["confirm_window_min"] = 3
+        book = self.tf.PendingBook()
+        bars = self._bars([1, 2])
+        self.assertTrue(book.arm("NIFTY", "CE", "VB", 100.0, 2, bars))
+        confirming = {"minute": 7, "open": 0, "high": 0, "low": 0, "close": 1e9}
+        # minute 7 is 5 past arming: outside the window, however good the bar.
+        self.assertIsNone(book.on_minute_close("NIFTY", confirming, 7),
+                          "filled a pending entry after its window expired")
+        self.assertEqual(book.pending, {})
+
+    def test_confirmation_inside_the_window_still_fills(self):
+        from config import RISK
+        RISK["entry_timing"] = self.tf.CONTINUATION
+        RISK["confirm_window_min"] = 3
+        book = self.tf.PendingBook()
+        book.arm("NIFTY", "CE", "VB", 100.0, 2, self._bars([1, 2]))
+        bar = {"minute": 4, "open": 0, "high": 0, "low": 0, "close": 1e9}
+        self.assertIsNotNone(book.on_minute_close("NIFTY", bar, 4))
+
+    def test_sweep_drops_entries_when_the_feed_stalls(self):
+        """No tick means no minute close means on_minute_close never runs."""
+        from config import RISK
+        RISK["entry_timing"] = self.tf.CONTINUATION
+        RISK["confirm_window_min"] = 3
+        book = self.tf.PendingBook()
+        book.arm("NIFTY", "CE", "VB", 100.0, 2, self._bars([1, 2]))
+        self.assertEqual(book.sweep_expired(4), 0)      # still inside window
+        self.assertIn("NIFTY", book.pending)
+        self.assertEqual(book.sweep_expired(600), 1)    # much later
+        self.assertEqual(book.pending, {})
+
+    def test_book_is_thread_safe(self):
+        from config import RISK
+        RISK["entry_timing"] = self.tf.CONTINUATION
+        RISK["confirm_window_min"] = 3
+        book = self.tf.PendingBook()
+        bars = self._bars([1, 2])
+        errors = []
+
+        def arm_many():
+            try:
+                for i in range(300):
+                    book.arm("SYM%d" % (i % 7), "CE", "VB", 100.0, 2, bars)
+            except Exception as exc:                      # pragma: no cover
+                errors.append(exc)
+
+        def drain():
+            try:
+                for _ in range(300):
+                    book.sweep_expired(10_000)
+                    book.clear("SYM3")
+            except Exception as exc:                      # pragma: no cover
+                errors.append(exc)
+
+        threads = ([threading.Thread(target=arm_many) for _ in range(3)] +
+                   [threading.Thread(target=drain) for _ in range(3)])
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [], "concurrent access to PendingBook raised")
+
+
 if __name__ == "__main__":
     unittest.main()
