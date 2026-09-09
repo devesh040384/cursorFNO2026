@@ -17,9 +17,33 @@
 set -uo pipefail
 
 APP_DIR="${APP_DIR:-/home/ec2-user/cursor_FNO}"
-VENV="${VENV:-$APP_DIR/venv}"
 LOG_DIR="$APP_DIR/logs"
 export TZ="Asia/Kolkata"
+
+# Interpreter discovery. VENV can be set explicitly; otherwise the usual places
+# are tried in order. Hardcoding one path meant the script died with "no
+# interpreter" and no clue which paths it had considered -- the failure told you
+# it was broken but not how to fix it, which is the least useful kind.
+find_python() {
+  local candidates=()
+  [ -n "${VENV:-}" ] && candidates+=("$VENV")
+  candidates+=("$APP_DIR/venv" "$APP_DIR/.venv" "$HOME/venv" "$HOME/.venv")
+
+  local base exe
+  for base in "${candidates[@]}"; do
+    for exe in "$base/bin/python3" "$base/bin/python"; do
+      if [ -x "$exe" ]; then
+        echo "$exe"
+        return 0
+      fi
+    done
+  done
+
+  # Last resort: a system interpreter. Works only if dependencies were installed
+  # globally, so it is reported loudly rather than used silently.
+  command -v python3 2>/dev/null && return 0
+  return 1
+}
 
 DAY="$(date +%F)"
 BOOT_LOG="$LOG_DIR/boot_${DAY}.log"
@@ -62,7 +86,7 @@ launch() {
   # while nothing is running. That failure mode is silent, which is the worst
   # kind for something you only check once a day.
   tmux new-session -d -s "$session" -c "$APP_DIR" \
-    "exec $VENV/bin/python3 -u $script >> '$logfile' 2>&1"
+    "exec '$PYTHON' -u $script >> '$logfile' 2>&1"
 
   sleep 2
   if tmux has-session -t "$session" 2>/dev/null; then
@@ -76,10 +100,23 @@ launch() {
 
 log "=== start_bot.sh: $DAY, uptime $(cut -d' ' -f1 /proc/uptime)s ==="
 
-if [ ! -x "$VENV/bin/python3" ]; then
-  log "FATAL: no interpreter at $VENV/bin/python3"
+PYTHON="$(find_python || true)"
+if [ -z "$PYTHON" ]; then
+  log "FATAL: no python interpreter found."
+  log "  Looked for bin/python3 and bin/python under:"
+  log "    VENV=${VENV:-<unset>}"
+  log "    $APP_DIR/venv, $APP_DIR/.venv, $HOME/venv, $HOME/.venv"
+  log "  and found no system python3 on PATH."
+  log "  Fix: VENV=/path/to/your/venv $0"
   exit 1
 fi
+case "$PYTHON" in
+  "$APP_DIR"/*|"$HOME"/venv/*|"$HOME"/.venv/*)
+    log "interpreter: $PYTHON" ;;
+  *)
+    log "WARN using SYSTEM interpreter $PYTHON -- no virtualenv found."
+    log "     Works only if dependencies are installed globally." ;;
+esac
 
 wait_for_network
 

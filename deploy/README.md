@@ -69,6 +69,7 @@ rather than picking a default and stopping your instance at 09:00.
 ```bash
 cd ~/cursor_FNO
 chmod +x deploy/start_bot.sh deploy/stop_bot.sh
+./deploy/start_bot.sh          # run it directly, not with `sh` -- it needs bash
 sudo timedatectl set-timezone Asia/Kolkata     # so cron times mean IST
 sudo yum install -y tmux sqlite                # if not already present
 ```
@@ -83,6 +84,27 @@ Then `crontab -e`:
 The `sleep 20` gives the network stack time to come up. `start_bot.sh` also
 polls for reachability, so this is belt-and-braces — boot ordering is the kind
 of thing that works on every test and fails on the morning you stop watching.
+
+### If it cannot find your interpreter
+
+`start_bot.sh` looks for `bin/python3` then `bin/python` under, in order:
+`$VENV` (if set), `$APP_DIR/venv`, `$APP_DIR/.venv`, `~/venv`, `~/.venv`, and
+finally a system `python3`. A system interpreter is used only with a loud
+warning, because it works solely if dependencies were installed globally.
+
+If yours is somewhere else, find it and pass it in:
+
+```bash
+ls -d ~/*/bin/python3 ~/*/*/bin/python3 2>/dev/null
+# or, if the venv is currently active:
+which python3
+```
+
+Then set it in the crontab line rather than editing the script:
+
+```cron
+@reboot  sleep 20 && VENV=/home/ec2-user/myenv /home/ec2-user/cursor_FNO/deploy/start_bot.sh
+```
 
 ## 4. Logs
 
