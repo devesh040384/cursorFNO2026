@@ -4,6 +4,47 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-09 — Scheduled start/stop, and a correction about the deployment
+
+`deploy/` adds the Lambda and shell scripts that run the instance only during
+market hours:
+
+    09:00 IST  Lambda StartInstances -> cron @reboot -> start_bot.sh -> tmux
+    15:35 IST  cron -> stop_bot.sh -> SIGTERM, WAL checkpoint
+    15:45 IST  Lambda StopInstances
+
+**The ten-minute gap is the design.** An instance stop is not a clean unmount.
+Without a graceful shutdown first, SQLite is killed mid-write and the last
+minutes of a session are the part most likely to be missing — exactly the part
+nobody notices is gone. `stop_bot.sh` signals the pane's python process rather
+than killing the tmux session, waits, then checkpoints both databases.
+
+`start_bot.sh` is idempotent (`tmux has-session` before every launch), waits for
+network reachability before starting, and uses `exec` in the pane so a crashed
+process does not leave an idle shell that `has-session` reports as healthy. One
+dated log file per process per day.
+
+The Lambda takes `action` from the EventBridge rule's constant input and refuses
+to run without it — a misconfigured rule fails visibly instead of picking a
+default and stopping the instance at 09:00. It also skips start on dates listed
+in `HOLIDAYS`, because EventBridge cron can express "weekdays" but not "NSE
+trading days".
+
+**Correction.** Yesterday's ops page led with "nothing is running" and claimed
+the Sep 4 and Sep 8 sessions were lost to a missing persistence mechanism. Both
+were wrong. The instance is scheduled, so `pgrep` outside market hours correctly
+returns nothing, and a day with zero trades is not a day with no bot. The
+option-chain data shows Sep 7, 8 and 9 each captured a full session — 5,588 rows
+from 09:0x to 15:28.
+
+Also corrected: OI progress is **3 usable sessions**, not the ~11 previously
+stated. That number was inferred from the database file size rather than
+counted. The fourth `trade_date` present is 44 rows at 23:55 on a weekend — the
+artifact the `in_session` guard exists to flag. First look moves to ~early Nov,
+out-of-sample to ~late Dec.
+
+---
+
 ## 2026-09-08 — Correction: NIFTY lot is 65; the "fix" that changed it was wrong
 
 Earlier today `FALLBACK_LOT_SIZE["NIFTY"]` was changed from **65 to 75** on the
