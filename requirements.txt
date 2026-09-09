@@ -11,8 +11,17 @@
 # after a successful install to capture the "what did it get" list, and use the
 # lock file when you need to reproduce an environment exactly.
 
-# Broker API. Pulls logzero and its own transport dependencies.
+# Broker API.
 smartapi-python
+
+# smartapi-python imports logzero at module scope but does not declare it in
+# its install_requires. Without this line the venv installs "successfully" and
+# then dies on `import SmartApi` -- a failure that only shows up when the bot
+# starts, which on this deployment means 09:00 on a trading morning.
+logzero
+
+# Also imported by SmartApi's transport layer without being declared.
+six
 
 # TOTP for the login flow
 pyotp
