@@ -15,3 +15,9 @@ rsi_state.json
 *.log
 logs/
 backtest_cache/
+
+# Virtualenv — was committed (8,067 files); git flattened its symlinks to
+# text and dropped the exec bits, so it never had a working interpreter.
+venv/
+.venv/
+requirements.lock.txt
