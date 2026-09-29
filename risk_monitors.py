@@ -54,8 +54,12 @@ def _trailed_stop(entry_price, peak_price, current_price, current_sl):
     trade that jumps several tiers between polls still gets the top lock.
     """
     best = float(current_sl or 0.0)
+    # The tier is earned at the best price seen, not at wherever the quote is
+    # on this poll. A bar that trades +30% and closes at +10% has still earned
+    # the +26% lock; live's 5-second poll would have written it on the way up.
+    mark = max(float(current_price or 0.0), float(peak_price or 0.0))
     for tier in _trail_tiers():
-        if current_price < entry_price * float(tier["at"]):
+        if mark < entry_price * float(tier["at"]):
             continue
         mode = str(tier.get("mode", "entry")).lower()
         value = float(tier.get("value", 0.0))

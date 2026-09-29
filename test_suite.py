@@ -301,6 +301,28 @@ class TestAlgoEngineCore(unittest.TestCase):
         self.assertEqual(bid, 79.5)
         self.assertEqual(ask, 80.5)
 
+    def test_quote_fetch_failure_does_not_pass_liquidity(self):
+        class QuoteDown:
+            def ltpData(self, *a, **k):
+                return {"status": True, "data": {"ltp": 100.0}}
+
+            def getMarketData(self, *a, **k):
+                return {"status": False, "message": "down"}
+
+        scrip = [{
+            "name": "NIFTY",
+            "symbol": "NIFTY08OCT2624500CE",
+            "token": "1",
+            "strike": 2450000.0,
+            "expiry": "08-Oct-2026",
+            "instrumenttype": "OPTIDX",
+            "exch_seg": "NFO",
+            "lotsize": 65,
+        }]
+        builder = DynamicOptionsChainBuilder(index_name="NIFTY", smart_api=QuoteDown())
+        builder.load_scrip_master(scrip)
+        self.assertIsNone(builder.get_nearest_expiry_contract(24500.0, "CE"))
+
     def test_scorecard_by_entry_reason(self):
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -476,17 +498,29 @@ class TestAlgoEngineCore(unittest.TestCase):
             os.remove(path)
 
     def test_duplicate_fut_ticks_do_not_inflate_volume(self):
+        from config import signal_bar_bucket
+
         gate = VolumeExpansionGate()
         gate.mark_subscribed("NIFTY", True)
-        gate.last_bar_time["NIFTY"] = 1.0
-        gate.last_bar_bucket["NIFTY"] = 1
+        now = time.time()
+        gate.last_bar_time["NIFTY"] = now
+        gate.last_bar_bucket["NIFTY"] = signal_bar_bucket(now)
         gate.last_session_vol["NIFTY"] = 1000.0
         gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0, sequence_number=10)
         gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0, sequence_number=10)
         gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0)
         self.assertEqual(gate.forming_vol["NIFTY"], 12.0)
+        # A new sequence with the same cumulative volume and the same last-trade
+        # qty is a quote update, not another trade. Counting it again inflates
+        # the bar by the message rate and fakes a breakout.
         gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0, sequence_number=11)
-        self.assertEqual(gate.forming_vol["NIFTY"], 24.0)
+        self.assertEqual(gate.forming_vol["NIFTY"], 12.0)
+        # The cumulative field catching up must not book the trade a second time.
+        gate.on_fut_tick("NIFTY", volume_traded_today=1012.0, last_traded_qty=12.0, sequence_number=12)
+        self.assertEqual(gate.forming_vol["NIFTY"], 12.0)
+        # A later, real advance still counts.
+        gate.on_fut_tick("NIFTY", volume_traded_today=1020.0, last_traded_qty=8.0, sequence_number=13)
+        self.assertEqual(gate.forming_vol["NIFTY"], 20.0)
 
     def test_paper_exit_refuses_zero_fill(self):
         class DummyAPI:
@@ -561,6 +595,8 @@ class HistorySeedTests(unittest.TestCase):
         # Seeded history must never carry a stale breakout into the live session.
         self.assertIsNone(gate.breakout_event["NIFTY"])
         self.assertFalse(gate.has_fresh_breakout("NIFTY"))
+        # The in-progress bucket was not in the seed. Its remainder is partial.
+        self.assertTrue(gate.partial_first_bar["NIFTY"])
         # Bar clock parked on the current bucket so the first tick is not a close.
         self.assertEqual(brain.last_signal_buckets["NIFTY"], signal_bar_bucket(time.time()))
 
@@ -674,6 +710,49 @@ class FeedGapTests(unittest.TestCase):
         brain.evaluate_tick("NIFTY", 24100.0)
         self.assertGreater(brain.stale_bars["NIFTY"], 0)
 
+    def test_stalled_quote_does_not_double_count_when_cumulative_catches_up(self):
+        gate = VolumeExpansionGate()
+        gate.mark_subscribed("NIFTY", True)
+        gate.last_bar_time["NIFTY"] = time.time()
+        gate.last_bar_bucket["NIFTY"] = 1
+        gate.last_session_vol["NIFTY"] = 1000.0
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=12.0, sequence_number=1)
+        gate.on_fut_tick("NIFTY", volume_traded_today=1000.0, last_traded_qty=7.0, sequence_number=2)
+        self.assertEqual(gate.forming_vol["NIFTY"], 19.0)
+        gate.on_fut_tick("NIFTY", volume_traded_today=1019.0, last_traded_qty=7.0, sequence_number=3)
+        self.assertEqual(gate.forming_vol["NIFTY"], 19.0)
+
+    def test_flush_books_the_volume_bar_the_price_signal_reads(self):
+        from config import signal_bar_bucket, signal_bar_sec
+
+        gate = VolumeExpansionGate()
+        gate.mark_subscribed("NIFTY", True)
+        gate.closed_volumes["NIFTY"] = [100.0] * 7
+        gate.forming_vol["NIFTY"] = 500.0
+        gate.partial_first_bar["NIFTY"] = False
+        now = time.time()
+        bar = signal_bar_sec()
+        gate.last_bar_time["NIFTY"] = now - bar + 1
+        gate.last_bar_bucket["NIFTY"] = signal_bar_bucket(now - bar)
+        gate.flush_closed_bar("NIFTY", now)
+        self.assertEqual(gate.closed_volumes["NIFTY"][-1], 500.0)
+        self.assertTrue(gate.has_fresh_breakout("NIFTY"))
+        # A futures tick that arrives after the flush belongs to the new bar.
+        gate.on_fut_tick("NIFTY", volume_traded_today=None, last_traded_qty=9.0, sequence_number=1)
+        self.assertEqual(gate.forming_vol["NIFTY"], 9.0)
+        self.assertEqual(gate.closed_volumes["NIFTY"][-1], 500.0)
+
+    def test_closed_candle_is_booked_on_its_own_bar(self):
+        from config import signal_bar_sec
+
+        gate = VolumeExpansionGate()
+        gate.mark_subscribed("NIFTY", True)
+        bar = signal_bar_sec()
+        now = time.time() - (time.time() % bar)
+        gate.book_closed_bar("NIFTY", 111.0, now)
+        gate.book_closed_bar("NIFTY", 222.0, now + bar)
+        self.assertEqual(gate.closed_volumes["NIFTY"], [111.0, 222.0])
+
 
 class ISTTimeTests(unittest.TestCase):
     def test_ist_helpers_are_offset_from_utc(self):
@@ -739,6 +818,10 @@ class TrailLadderTests(unittest.TestCase):
     def test_tier_jump_between_polls_takes_the_best_lock(self):
         # A gap-up straight from entry to +30% must not stop at the +4% tier.
         self.assertAlmostEqual(self.f(self.E, 130.0, 130.0, self.INIT_SL), 122.5)
+
+    def test_pullback_keeps_the_tier_the_peak_earned(self):
+        # Peak printed +30%; this poll is back at +10%. The lock follows the peak.
+        self.assertAlmostEqual(self.f(self.E, 130.0, 110.0, self.INIT_SL), 122.5)
 
     def test_locked_gain_never_exceeds_the_peak(self):
         for peak in range(101, 160):
@@ -2225,13 +2308,22 @@ class OICollectorTests(unittest.TestCase):
             return {"status": True, "data": {"fetched": rows}}
 
     def _builder(self):
+        from datetime import timedelta
+        from ist_time import ist_now
         from options_chain_builder import DynamicOptionsChainBuilder
+        # A fixed expiry rots the day after it. 24-Sep-2026 made every snapshot
+        # test return zero rows from 25 Sep onward, which looks like a collector
+        # failure and is only a stale fixture.
+        exp_dt = ist_now().replace(tzinfo=None) + timedelta(days=21)
+        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        expiry = "%02d-%s-%d" % (exp_dt.day, months[exp_dt.month - 1], exp_dt.year)
         scrip = []
         for k in range(76000, 77100, 100):
             for t in ("CE", "PE"):
-                scrip.append({"name": "SENSEX", "symbol": "SENSEX26SEP%d%s" % (k, t),
+                scrip.append({"name": "SENSEX", "symbol": "SENSEX%d%s" % (k, t),
                               "token": "T%d%s" % (k, t), "strike": float(k * 100),
-                              "expiry": "24-Sep-2026", "instrumenttype": "OPTIDX",
+                              "expiry": expiry, "instrumenttype": "OPTIDX",
                               "exch_seg": "BFO", "lotsize": 20})
         b = DynamicOptionsChainBuilder(index_name="SENSEX", smart_api=None)
         b.load_scrip_master(scrip)
@@ -2633,8 +2725,23 @@ class HigherTimeframeTests(unittest.TestCase):
         htf = sl.aggregate(bars, 3)
         for h in htf:
             pass
-        # 14 bars on day 1 -> 4 complete buckets; 6 on day 2 -> 2. Never 6+.
-        self.assertEqual(len(htf), 6)
+        # Day 1 (09:15-10:20) has four complete 15-min buckets. Day 2 starts at
+        # 10:25, so only 10:30-10:40 is complete. A shifted consecutive grouping
+        # would have emitted two day-2 bars and reported 6.
+        self.assertEqual(len(htf), 5)
+
+    def test_a_missing_bar_does_not_shift_later_buckets(self):
+        import signal_lab as sl
+        bars = self._series(drift=0.001, n=30)
+        removed = bars.pop(1)  # 09:20, inside the 09:15 bucket
+        htf = sl.aggregate(bars, 3)
+        # 09:15 bucket is incomplete and dropped. The next bar is still 09:30,
+        # not a reshuffle of whatever three closes happen to remain.
+        self.assertNotEqual(htf[0]["open"], bars[0]["open"])
+        self.assertEqual(htf[0]["open"], bars[2]["open"])
+        self.assertEqual(htf[0]["dt"].minute, 40)  # 09:30 bucket closes at 09:40
+        self.assertEqual(len(htf), 9)
+        self.assertNotEqual(removed["dt"], htf[0]["dt"])
 
     def test_bias_fires_with_direction(self):
         import signal_lab as sl
@@ -2662,6 +2769,15 @@ class HigherTimeframeTests(unittest.TestCase):
             b["close"] = b["high"] = b["low"] = 1.0    # destroy the future
         sl._HTF_CACHE.clear()
         self.assertEqual(sl.htf_bias(tampered, i), before)
+
+    def test_flat_close_is_not_a_short(self):
+        import signal_lab as sl
+        bars = self._series(n=12)
+        for b in bars:
+            b["close"] = b["open"] = b["high"] = b["low"] = 24000.0
+        fut = [{"volume": 100.0} for _ in bars]
+        fut[-1]["volume"] = 1000.0
+        self.assertIsNone(sl.sig_volume_breakout(bars, len(bars) - 1, fut))
 
     def test_filtered_signal_is_a_subset_of_the_base(self):
         """The filter can only remove triggers, never create them."""
