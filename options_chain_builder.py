@@ -307,11 +307,12 @@ class DynamicOptionsChainBuilder:
                         mode="FULL", exchangeTokens={exchange: [str(contract_token)]}
                     )
                     if not (q_resp and q_resp.get("status")):
-                        if ltp > 0:
-                            logging.info(
-                                f"[LIQUIDITY PASSED] {contract_symbol} | LTP-only (quote fetch failed)"
-                            )
-                            return packed
+                        # A missing quote is not a pass. The spread cap exists
+                        # because crossing a wide market costs more than the
+                        # measured edge; an unknown spread is not a tight one.
+                        logging.info(
+                            f"[LIQUIDITY] {contract_symbol} quote fetch failed; trying next strike"
+                        )
                         continue
                     q_data = self._quote_row(q_resp)
                     depth = {}

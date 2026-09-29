@@ -46,6 +46,10 @@ class VolumeExpansionGate:
         self.zero_bar_streak = {symbol: 0 for symbol in INDICES_CONFIG.keys()}
         self.last_seq = {symbol: None for symbol in INDICES_CONFIG.keys()}
         self.last_tick_sig = {symbol: None for symbol in INDICES_CONFIG.keys()}
+        # Last-trade qty booked while the cumulative field was stalled, so the
+        # catch-up tick does not count that trade a second time.
+        self.pending_ltq = {symbol: 0.0 for symbol in INDICES_CONFIG.keys()}
+        self.last_synthetic = {symbol: None for symbol in INDICES_CONFIG.keys()}
         # First live bar starts mid-bucket: its partial volume would drag the SMA
         # down and fake an expansion on the next bar. Discard it once.
         self.partial_first_bar = {symbol: False for symbol in INDICES_CONFIG.keys()}
@@ -193,9 +197,8 @@ class VolumeExpansionGate:
         if symbol not in INDICES_CONFIG:
             return
         now = time.time()
-        bucket = signal_bar_bucket(now)
-        bar_sec = signal_bar_sec()
         if self.last_bar_time[symbol] == 0.0:
+            bucket = signal_bar_bucket(now)
             self.last_bar_time[symbol] = now
             self.last_bar_bucket[symbol] = bucket
             # Only partial if we joined mid-bucket with no seeded history.
@@ -211,33 +214,127 @@ class VolumeExpansionGate:
                 return
         self.last_tick_sig[symbol] = (volume_traded_today, last_traded_qty)
 
-        increment = 0.0
+        increment = self._volume_increment(symbol, volume_traded_today, last_traded_qty)
+        self._roll_volume(symbol, now, increment)
+
+    def _volume_increment(self, symbol, volume_traded_today, last_traded_qty):
+        """Volume added by this tick.
+
+        Cumulative session volume is the source of truth when it advances.
+        A quote often repeats the previous last-trade qty under a new sequence
+        number while the cumulative field is unchanged; adding that qty on every
+        message inflates the bar by the quote rate and manufactures a breakout.
+        The qty is booked at most once per stalled reading, and deducted from
+        the next cumulative advance so the catch-up does not count it again.
+        """
         if volume_traded_today is not None:
             prev = self.last_session_vol[symbol]
             current = float(volume_traded_today)
-            if prev is None:
-                increment = 0.0
-            else:
-                increment = max(0.0, current - prev)
             self.last_session_vol[symbol] = current
-            # Session cumulative often stalls on a tick; last trade qty still moves.
-            if increment == 0.0 and last_traded_qty is not None:
-                increment = max(0.0, float(last_traded_qty))
-        elif last_traded_qty is not None:
-            increment = max(0.0, float(last_traded_qty))
+            if prev is None:
+                return 0.0
+            increment = max(0.0, current - prev)
+            pending = float(self.pending_ltq.get(symbol) or 0.0)
+            if increment > 0:
+                if pending > 0:
+                    credit = min(increment, pending)
+                    increment -= credit
+                    self.pending_ltq[symbol] = pending - credit
+                self.last_synthetic[symbol] = None
+                return increment
+            if last_traded_qty is None:
+                return 0.0
+            synthetic = max(0.0, float(last_traded_qty))
+            sig = (current, synthetic)
+            if synthetic <= 0 or sig == self.last_synthetic.get(symbol):
+                return 0.0
+            self.pending_ltq[symbol] = pending + synthetic
+            self.last_synthetic[symbol] = sig
+            return synthetic
+        if last_traded_qty is not None:
+            return max(0.0, float(last_traded_qty))
+        return 0.0
 
+    def _roll_volume(self, symbol, now, increment):
+        """Close the forming bar when the clock bucket (or elapsed bar) rolls.
+
+        Returns True when a roll happened. A multi-bar gap drops the partial
+        instead of closing it: that bar holds a fraction of the traded volume,
+        and padding the hole with zeros would crater the SMA and fake the next
+        expansion.
+        """
+        bar_sec = signal_bar_sec()
+        bucket = signal_bar_bucket(now)
         last_bucket = self.last_bar_bucket[symbol]
         clock_rolled = last_bucket is not None and bucket != last_bucket
         elapsed_rolled = now - self.last_bar_time[symbol] >= bar_sec
-        if clock_rolled or elapsed_rolled:
-            # A feed gap (reconnect) spans several buckets but only closes one bar,
-            # so the "bar" holds a fraction of the traded volume. Padding with zeros
-            # would crater the SMA and fake an expansion on the next bar, so drop the
-            # stale sticky state and let RVOL rebuild from clean bars instead.
+        if not (clock_rolled or elapsed_rolled):
+            self.forming_vol[symbol] += increment
+            return False
+        missed = int((now - self.last_bar_time[symbol]) // bar_sec) - 1
+        if missed > 0:
+            # A stale or never-set clock yields an absurd count; report it as a
+            # reset rather than "5960011 bars missed", which reads as corruption.
+            gap = (
+                f"{missed} bar(s) missed"
+                if missed <= MAX_SANE_GAP_BARS
+                else "clock reset / long outage"
+            )
+            logging.warning(
+                f"[{symbol}] Futures volume feed gap: {gap}. "
+                "Dropping partial bar and clearing sticky expansion."
+            )
+            self.volume_ok[symbol] = False
+            self.volume_ok_until[symbol] = 0.0
+            self.breakout_event[symbol] = None
+            self.forming_vol[symbol] = increment
+            self.last_bar_time[symbol] = now
+            self.last_bar_bucket[symbol] = bucket
+            return True
+        self._close_volume_bar(symbol, now, increment)
+        self.last_bar_bucket[symbol] = bucket
+        return True
+
+    def flush_closed_bar(self, symbol, now=None):
+        """Book the forming futures bar if the price bar has already rolled.
+
+        Index ticks and futures ticks arrive as separate messages. If the index
+        tick crosses the boundary first, the signal used to read the previous
+        bar's expansion. Flushing here makes the volume bar and the price bar
+        the same bar. A multi-bar gap is left to the futures handler so a dead
+        feed does not append zero-volume bars and fake the next expansion.
+        """
+        if symbol not in INDICES_CONFIG or not self.subscribed.get(symbol):
+            return
+        now = time.time() if now is None else now
+        if self.last_bar_time.get(symbol, 0.0) == 0.0:
+            return
+        if self.last_bar_bucket.get(symbol) == signal_bar_bucket(now):
+            return
+        missed = int((now - self.last_bar_time[symbol]) // signal_bar_sec()) - 1
+        if missed > 0:
+            return
+        self._roll_volume(symbol, now, 0.0)
+
+    def book_closed_bar(self, symbol, volume, now=None):
+        """Book one already-closed bar (the backtest has one sample per candle).
+
+        The live tick path closes the bar that was forming, then starts the next
+        one with this tick's increment. Feeding a candle's whole volume as that
+        increment stores it one bar late and pairs it with the next bar's
+        direction. Anchoring one bucket back closes THIS candle before the
+        price signal reads it.
+        """
+        if symbol not in INDICES_CONFIG:
+            return
+        now = time.time() if now is None else now
+        bar_sec = signal_bar_sec()
+        if self.last_bar_time.get(symbol, 0.0) != 0.0:
             missed = int((now - self.last_bar_time[symbol]) // bar_sec) - 1
             if missed > 0:
-                # A stale or never-set clock yields an absurd count; report it as a
-                # reset rather than "5960011 bars missed", which reads as corruption.
+                self.volume_ok[symbol] = False
+                self.volume_ok_until[symbol] = 0.0
+                self.breakout_event[symbol] = None
                 gap = (
                     f"{missed} bar(s) missed"
                     if missed <= MAX_SANE_GAP_BARS
@@ -245,19 +342,13 @@ class VolumeExpansionGate:
                 )
                 logging.warning(
                     f"[{symbol}] Futures volume feed gap: {gap}. "
-                    "Dropping partial bar and clearing sticky expansion."
+                    "Booking the completed bar only; sticky expansion cleared."
                 )
-                self.volume_ok[symbol] = False
-                self.volume_ok_until[symbol] = 0.0
-                self.breakout_event[symbol] = None
-                self.forming_vol[symbol] = increment
-                self.last_bar_time[symbol] = now
-                self.last_bar_bucket[symbol] = bucket
-                return
-            self._close_volume_bar(symbol, now, increment)
-            self.last_bar_bucket[symbol] = bucket
-        else:
-            self.forming_vol[symbol] += increment
+        self.partial_first_bar[symbol] = False
+        self.last_bar_time[symbol] = now - bar_sec
+        self.last_bar_bucket[symbol] = signal_bar_bucket(now - bar_sec)
+        self.forming_vol[symbol] = float(volume)
+        self._roll_volume(symbol, now, 0.0)
 
 
 class StrategyBrain:
@@ -632,6 +723,11 @@ class StrategyBrain:
             self.last_candle_times[symbol] = current_time
             self.last_signal_buckets[symbol] = bucket
             state_changed = True
+            # Futures ticks are a different message and often arrive after this
+            # one. Close the volume bar first so the signal below reads THIS
+            # bar's expansion, not the previous bar's.
+            if closed_bar:
+                self.volume_gate.flush_closed_bar(symbol, current_time)
         elif len(history) == 0:
             history.append(spot_price)
             self.last_candle_times[symbol] = current_time

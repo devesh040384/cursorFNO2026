@@ -179,7 +179,7 @@ Priority on each **closed 5-min** bar: **VOLUME_BREAKOUT** first, then trend pat
   alone can walk a position into the −10% stop with no adverse spot move; set
   `1` to skip expiry day or `2` to force the next weekly. Trade-off: higher DTE
   means lower gamma, so **+30% is slower to reach**.
-- Liquidity: min option volume 500; spread ≤ **1.5%** when depth exists (no invented 2% spread)
+- Liquidity: min option volume 500; spread ≤ **1.5%** when depth exists (no invented 2% spread). A failed quote is a skip, not a pass — an unknown spread is not treated as a tight one.
 - Targets / SL (trending): **+30% / −10%** (3:1)
 - `expiry`, `dte` and `max_favorable_price` are stored on every trade so the DTE
   question can be answered from data instead of assumption

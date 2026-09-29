@@ -232,6 +232,11 @@ def seed_volume_history(smart_api, gate, symbol, fut, bars=None):
     now = time.time()
     gate.last_bar_time[symbol] = now
     gate.last_bar_bucket[symbol] = signal_bar_bucket(now)
+    # The candle in progress was dropped above. Live ticks only see the rest of
+    # that bucket, so the next close is a partial bar. Keeping it pulls the SMA
+    # down and fakes an expansion on the following bar — the same fault the
+    # unseeded path already discards.
+    gate.partial_first_bar[symbol] = True
     # Seeded bars are historical: never let them fire a stale breakout event.
     gate.breakout_event[symbol] = None
     gate.volume_ok[symbol] = False

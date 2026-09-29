@@ -4,6 +4,26 @@ All notable bot / strategy changes. Format: newest first.
 
 ---
 
+## 2026-09-29 — Accuracy bugs in volume, liquidity, and the trail
+
+Six faults were changing which trades got taken, or booking them at the wrong price. None of them is a new signal. The screened result still stands: `VOLUME_BREAKOUT` does not predict index movement, and these fixes do not claim otherwise. They stop the bot from acting on a distorted version of the signal it already has.
+
+**Quote updates were counted as trades.** A new websocket sequence with an unchanged cumulative volume and the same last-trade qty was added again. That inflates a bar by the quote rate and manufactures a `VOLUME_BREAKOUT`. The qty is now booked once while the cumulative field is stalled, and subtracted from the catch-up tick so the same trade is not counted twice.
+
+**The volume bar and the price bar were not the same bar.** Index ticks and futures ticks are different messages. When the index tick crossed the boundary first, the signal read the previous bar's expansion. The price-bar close now flushes the forming futures bar first. The backtest had the same offset in the other direction: a candle's whole volume was fed as the next bar's increment, so every expansion was paired with the following bar's direction. Closed candles are booked on the bar they belong to.
+
+**The first live bar after a seed was a partial.** Startup drops the in-progress candle, then accumulates only the remainder. That short bar was written into the RVOL average, which makes the next full bar look like an expansion. It is discarded, the same way an unseeded join already discarded its first partial bar.
+
+**A failed option quote passed the liquidity check.** LTP-only was treated as liquid. The spread cap exists because crossing a wide market can cost more than the measured edge; an unknown spread is not a tight one. The entry is skipped.
+
+**The trail forgot a peak the close had given back.** Tier selection used the current quote. A bar that traded +30% and closed at +10% never locked the upper tier, so the backtest gave the excursion back. The tier is earned at the peak. The replay also checks that new stop before the time-stop, which is the order the live monitor already uses.
+
+**The 15-minute research filter shifted after a missing bar.** Buckets were "every three closes", so one gap moved every later bucket for the rest of the session. They now follow the clock, and an incomplete bucket is dropped. A flat close is no longer labelled a short in `signal_lab`; live already required a strict up or down bar.
+
+The option-chain collector tests were pinned to 24-Sep-2026. From the next session they resolved zero strikes and reported a broken collector. The fixture expiry is now relative.
+
+---
+
 ## 2026-09-09 — Scheduled start/stop, and a correction about the deployment
 
 `deploy/` adds the Lambda and shell scripts that run the instance only during

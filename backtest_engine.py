@@ -271,12 +271,17 @@ class Backtest:
             if pos.target and close_price >= pos.target:
                 return self.close_position(index, pos.target, "TARGET_HIT")
 
+        pos.peak = max(pos.peak, close_price)
+        pos.stop = _trailed_stop(pos.entry, pos.peak, close_price, pos.stop)
+        # Close is after the high, so a close back through the stop that high
+        # earned is a stop-out. Live checks the trailed stop before the time
+        # stop; doing this only on the next bar gives the excursion back.
+        if pos.stop and close_price <= pos.stop:
+            return self.close_position(index, pos.stop, "STOP_LOSS_HIT")
+
         held = (self.clock.dt - pos.opened_at).total_seconds() / 60.0
         if held >= RISK["time_stop_minutes"] and close_price < pos.entry * RISK["time_stop_min_gain_mult"]:
             return self.close_position(index, close_price, "TIME_STOP")
-
-        pos.peak = max(pos.peak, close_price)
-        pos.stop = _trailed_stop(pos.entry, pos.peak, close_price, pos.stop)
 
     # ---------------------------------------------------------------- the replay
 
@@ -369,7 +374,9 @@ class Backtest:
             for symbol in indices:
                 fut = slot.get("FUT_" + symbol)
                 if fut:
-                    brain.volume_gate.on_fut_tick(symbol, last_traded_qty=fut["volume"])
+                    # One closed candle, not a tick. on_fut_tick would park this
+                    # volume in the NEXT bar and pair it with the wrong direction.
+                    brain.volume_gate.book_closed_bar(symbol, fut["volume"])
                 bar = slot.get(symbol)
                 if not bar:
                     continue

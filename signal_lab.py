@@ -121,29 +121,53 @@ def required_index_move_pct(instrument="option", hold_minutes=0.0):
 HTF_FACTOR = 3          # 3 x 5-min = 15-min
 
 
+def _htf_bucket(bar, factor):
+    """Clock bucket, not 'every N bars'.
+
+    A missing 5-minute bar used to shift every later bucket for the rest of
+    the session, so the filter was reading a different 15 minutes than the
+    one it named.
+    """
+    width = BAR_MINUTES * factor
+    minute = bar["dt"].hour * 60 + bar["dt"].minute
+    return (bar["dt"].date(), minute // width)
+
+
+def _complete_htf(bars, factor):
+    """(htf_bars, end_indices) for clock-aligned complete buckets only."""
+    grouped = []
+    for idx, bar in enumerate(bars):
+        key = _htf_bucket(bar, factor)
+        if not grouped or grouped[-1][0] != key:
+            grouped.append((key, []))
+        grouped[-1][1].append(idx)
+    htf, ends = [], []
+    for _key, idxs in grouped:
+        if len(idxs) != factor:
+            continue
+        chunk = [bars[i] for i in idxs]
+        htf.append({
+            "dt": chunk[-1]["dt"],
+            "open": chunk[0]["open"],
+            "high": max(b["high"] for b in chunk),
+            "low": min(b["low"] for b in chunk),
+            "close": chunk[-1]["close"],
+            "volume": sum(b.get("volume", 0.0) for b in chunk),
+        })
+        ends.append(idxs[-1])
+    return htf, ends
+
+
 def aggregate(bars, factor=HTF_FACTOR):
     """Build higher-timeframe bars from the 5-minute series.
 
-    Groups strictly within a session and only emits COMPLETE buckets, so a
-    partial bar at the session edge cannot masquerade as a closed one.
+    Buckets follow the clock (09:15, 09:30, ...) and only COMPLETE buckets are
+    emitted, so a missing bar drops that bucket instead of shifting every bar
+    after it. A partial bar at the session edge cannot masquerade as a closed
+    one.
     """
-    out = []
-    bucket = []
-    for bar in bars:
-        if bucket and bar["dt"].date() != bucket[0]["dt"].date():
-            bucket = []
-        bucket.append(bar)
-        if len(bucket) == factor:
-            out.append({
-                "dt": bucket[-1]["dt"],
-                "open": bucket[0]["open"],
-                "high": max(b["high"] for b in bucket),
-                "low": min(b["low"] for b in bucket),
-                "close": bucket[-1]["close"],
-                "volume": sum(b.get("volume", 0.0) for b in bucket),
-            })
-            bucket = []
-    return out
+    htf, _ends = _complete_htf(bars, factor)
+    return htf
 
 
 # Aggregating inside the signal would be O(n^2) over 18,500 bars. Aggregate once
@@ -158,23 +182,7 @@ def _htf_index(bars, factor=HTF_FACTOR):
     hit = _HTF_CACHE.get(key)
     if hit is not None:
         return hit
-    htf, ends, bucket, start = [], [], [], 0
-    for idx, bar in enumerate(bars):
-        if bucket and bar["dt"].date() != bucket[0]["dt"].date():
-            bucket = []
-        if not bucket:
-            start = idx
-        bucket.append(bar)
-        if len(bucket) == factor:
-            htf.append({
-                "dt": bucket[-1]["dt"], "open": bucket[0]["open"],
-                "high": max(b["high"] for b in bucket),
-                "low": min(b["low"] for b in bucket),
-                "close": bucket[-1]["close"],
-                "volume": sum(b.get("volume", 0.0) for b in bucket),
-            })
-            ends.append(idx)          # source index where this HTF bar completed
-            bucket = []
+    htf, ends = _complete_htf(bars, factor)
     _HTF_CACHE.clear()                # one series at a time; keeps memory flat
     _HTF_CACHE[key] = (htf, ends)
     return htf, ends
@@ -248,7 +256,13 @@ def sig_volume_breakout(bars, i, fut):
     avg = sum(vols[:-1]) / len(vols[:-1])
     if avg <= 0 or vols[-1] < 1.2 * avg:
         return None
-    return "CE" if bars[i]["close"] > bars[i - 1]["close"] else "PE"
+    # A flat bar is not a direction. Live requires a strict up or down close;
+    # mapping equal closes to PE biased the screen toward shorts.
+    if bars[i]["close"] > bars[i - 1]["close"]:
+        return "CE"
+    if bars[i]["close"] < bars[i - 1]["close"]:
+        return "PE"
+    return None
 
 
 def sig_opening_range_break(bars, i, fut):
